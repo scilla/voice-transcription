@@ -1,0 +1,3 @@
+openai
+python-dotenv
+# Note: ffmpeg must be installed separately (brew install ffmpeg on macOS)
