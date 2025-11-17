@@ -1,6 +1,6 @@
 # Voice Transcription
 
-A small Python utility to transcribe audio/video files using OpenAI's transcription (diarized) model. It scans the `sources/` folder, lets you choose a file, extracts audio when needed, splits long recordings into chunks, and saves a diarized transcription to `transcription.txt`.
+A small Python utility to transcribe audio/video files using OpenAI's transcription (diarized) model. It scans the `sources/` folder, lets you choose a file, extracts audio when needed, splits long recordings into chunks, and saves a diarized transcription to `output/<source-name>.txt`.
 
 ## Features
 
@@ -8,7 +8,7 @@ A small Python utility to transcribe audio/video files using OpenAI's transcript
 - MP4 audio extraction (requires ffmpeg)
 - Automatic chunking for long audio files to stay within model duration limits
 - Diarized transcription (speaker-labeled segments) using the `gpt-4o-transcribe-diarize` model
-- Saves both segmented output and full transcript to `transcription.txt`
+- Saves both segmented output and the full transcript to `output/<source-name>.txt`
 
 ## Requirements
 
@@ -58,9 +58,9 @@ python3 speech.py
 - Detect if the file is an MP4 and extract audio to an MP3 using `ffmpeg`.
 - Check audio duration and split into chunks if longer than the model limit.
 - Call OpenAI's model to produce a diarized JSON response.
-- Save segment lines and the full transcript to `transcription.txt` in the project root.
+- Save segment lines and the full transcript to `output/<source-name>.txt`. The folder is created automatically if missing.
 
-After completion you'll see segmented output printed to the terminal and a saved `transcription.txt` file.
+After completion you'll see the segmented output printed to the terminal and find the transcript under `output/` with the same base filename as the source.
 
 ## Notes on behavior
 

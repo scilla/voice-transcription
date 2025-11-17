@@ -169,7 +169,8 @@ def format_timestamp(seconds: float) -> str:
 
 
 # Let user choose a file
-audio_file_path = choose_file()
+selected_source_path = choose_file()
+audio_file_path = selected_source_path
 
 # Extract audio from MP4 if needed
 if audio_file_path.lower().endswith(".mp4"):
@@ -225,9 +226,17 @@ finally:
 
 full_text_output = "\n".join([part for part in full_text_parts if part])
 
-with open("transcription.txt", "w") as f:
+output_dir = "./output"
+os.makedirs(output_dir, exist_ok=True)
+
+output_filename = os.path.splitext(os.path.basename(selected_source_path))[0] + ".txt"
+output_path = os.path.join(output_dir, output_filename)
+
+with open(output_path, "w") as f:
     f.write(f"\n#########\n{datetime.datetime.now()}\n")
-    f.write(f"File: {audio_file_path}\n")
+    f.write(f"Source file: {selected_source_path}\n")
+    if selected_source_path != audio_file_path:
+        f.write(f"Processed file: {audio_file_path}\n")
     f.write("Model: gpt-4o-transcribe-diarize\n\n")
     if hasattr(transcription, "segments"):
         f.write("Segments:\n")
@@ -241,4 +250,4 @@ with open("transcription.txt", "w") as f:
 
 print("Segments:")
 print("\n".join(segments_output))
-print("\nFull transcript saved to transcription.txt")
+print(f"\nFull transcript saved to {output_path}")
