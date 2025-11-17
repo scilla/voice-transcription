@@ -194,6 +194,7 @@ else:
 # Transcribe the audio (handling chunks if necessary)
 segments_output = []
 full_text_parts = []
+transcription = None
 
 try:
     for chunk_path, offset in chunks_with_offsets:
@@ -238,7 +239,7 @@ with open(output_path, "w") as f:
     if selected_source_path != audio_file_path:
         f.write(f"Processed file: {audio_file_path}\n")
     f.write("Model: gpt-4o-transcribe-diarize\n\n")
-    if hasattr(transcription, "segments"):
+    if transcription and hasattr(transcription, "segments"):
         f.write("Segments:\n")
         for line in segments_output:
             f.write(line + "\n")
