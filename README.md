@@ -89,12 +89,3 @@ brew install ffmpeg
 ## License
 
 MIT-style — feel free to reuse and adapt.
-
----
-
-If you want, I can also:
-
-- Add a small example `sources/` test file and a non-interactive CLI flag to pick a file by name.
-- Add unit tests for timestamp formatting and chunking logic.
-
-Reply what you'd like next.
