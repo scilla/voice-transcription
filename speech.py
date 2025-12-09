@@ -1,5 +1,6 @@
 import os
-from openai import OpenAI
+import time
+from openai import APITimeoutError, OpenAI
 import dotenv
 import datetime
 import subprocess
@@ -9,10 +10,14 @@ import shutil
 
 dotenv.load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+REQUEST_TIMEOUT_SECONDS = 300
+MAX_RETRIES = 1
+RETRY_BACKOFF_SECONDS = 5
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=REQUEST_TIMEOUT_SECONDS)
 
 MAX_MODEL_DURATION_SECONDS = 1400
-CHUNK_TARGET_DURATION_SECONDS = 1300
+CHUNK_TARGET_DURATION_SECONDS = 900
 
 def extract_audio_from_mp4(mp4_file):
     """Extract audio from MP4 file and save as MP3"""
@@ -168,6 +173,39 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds_fraction:06.3f}"
 
 
+def transcribe_chunk_with_retry(chunk_path: str):
+    """Send a chunk to the API with simple retries on timeout/network errors."""
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with open(chunk_path, "rb") as audio_file:
+                return client.audio.transcriptions.create(
+                    model="gpt-4o-transcribe-diarize",
+                    file=audio_file,
+                    response_format="diarized_json",
+                    chunking_strategy="auto",
+                    language="it",
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+        except APITimeoutError as exc:  # pragma: no cover - network dependent
+            last_error = exc
+            if attempt == MAX_RETRIES:
+                raise
+            wait_for = RETRY_BACKOFF_SECONDS * attempt
+            print(f"Timeout on attempt {attempt}/{MAX_RETRIES}, retrying in {wait_for}s...")
+            time.sleep(wait_for)
+        except Exception as exc:  # pragma: no cover - network dependent
+            last_error = exc
+            if attempt == MAX_RETRIES:
+                raise
+            wait_for = RETRY_BACKOFF_SECONDS * attempt
+            print(f"Error on attempt {attempt}/{MAX_RETRIES}, retrying in {wait_for}s... ({exc})")
+            time.sleep(wait_for)
+
+    raise last_error
+
+
 # Let user choose a file
 selected_source_path = choose_file()
 audio_file_path = selected_source_path
@@ -199,14 +237,7 @@ transcription = None
 try:
     for chunk_path, offset in chunks_with_offsets:
         print(f"Processing chunk: {os.path.basename(chunk_path)} (offset {offset:.1f}s)")
-        with open(chunk_path, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe-diarize",
-                file=audio_file,
-                response_format="diarized_json",
-                chunking_strategy="auto",
-                language="it",
-            )
+        transcription = transcribe_chunk_with_retry(chunk_path)
 
         if hasattr(transcription, "segments"):
             for segment in transcription.segments:
