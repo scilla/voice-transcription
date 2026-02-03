@@ -18,6 +18,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=REQUEST_TIMEOUT_SEC
 
 MAX_MODEL_DURATION_SECONDS = 1400
 CHUNK_TARGET_DURATION_SECONDS = 900
+CHUNK_OVERLAP_SECONDS = 5
 
 def extract_audio_from_mp4(mp4_file):
     """Extract audio from MP4 file and save as MP3"""
@@ -65,33 +66,52 @@ def get_audio_duration(audio_path):
         print("Error: ffprobe is not installed. Please install ffmpeg suite first.")
         sys.exit(1)
 
-def split_audio_file(audio_path, segment_length=CHUNK_TARGET_DURATION_SECONDS):
-    """Split audio into chunks suitable for the diarization model"""
+def split_audio_file(
+    audio_path,
+    segment_length=CHUNK_TARGET_DURATION_SECONDS,
+    overlap=CHUNK_OVERLAP_SECONDS,
+):
+    """Split audio into overlapping chunks suitable for the diarization model"""
+    if overlap >= segment_length:
+        raise ValueError("Overlap must be smaller than segment length.")
+
     temp_dir = tempfile.mkdtemp(prefix="segments_", dir=os.getcwd())
     base_name, ext = os.path.splitext(os.path.basename(audio_path))
-    output_pattern = os.path.join(temp_dir, f"{base_name}_part_%03d{ext}")
+    total_duration = get_audio_duration(audio_path)
+    step = segment_length - overlap
 
+    offsets = []
     try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-i",
-                audio_path,
-                "-f",
-                "segment",
-                "-segment_time",
-                str(segment_length),
-                "-c",
-                "copy",
-                "-map",
-                "0",
-                "-reset_timestamps",
-                "1",
-                output_pattern,
-            ],
-            check=True,
-            capture_output=True,
-        )
+        index = 0
+        start = 0.0
+        while start < total_duration:
+            duration = min(segment_length, total_duration - start)
+            output_file = os.path.join(
+                temp_dir, f"{base_name}_part_{index:03d}{ext}"
+            )
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-ss",
+                    str(start),
+                    "-t",
+                    str(duration),
+                    "-i",
+                    audio_path,
+                    "-c",
+                    "copy",
+                    "-map",
+                    "0",
+                    "-avoid_negative_ts",
+                    "1",
+                    output_file,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            offsets.append((output_file, start))
+            index += 1
+            start += step
     except subprocess.CalledProcessError as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         print(f"Error splitting audio: {e}")
@@ -101,20 +121,10 @@ def split_audio_file(audio_path, segment_length=CHUNK_TARGET_DURATION_SECONDS):
         print("Error: ffmpeg is not installed. Please install it first.")
         sys.exit(1)
 
-    chunk_files = sorted(
-        [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith(ext)]
-    )
-
-    if not chunk_files:
+    if not offsets:
         shutil.rmtree(temp_dir, ignore_errors=True)
         print("Failed to create audio chunks.")
         sys.exit(1)
-
-    offsets = []
-    current_offset = 0.0
-    for chunk in chunk_files:
-        offsets.append((chunk, current_offset))
-        current_offset += get_audio_duration(chunk)
 
     return temp_dir, offsets
 
