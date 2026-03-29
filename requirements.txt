@@ -4,6 +4,7 @@ fastapi
 uvicorn
 yt-dlp
 vercel-blob
+vercel
 requests
 httpx
 # Note: ffmpeg must be installed separately (brew install ffmpeg on macOS)

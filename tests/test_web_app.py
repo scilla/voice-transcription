@@ -1,6 +1,8 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -61,69 +63,58 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(storage.read_text("job-1", WEB_TRANSCRIPT_FILENAME, video_id="abc123"), "Legacy transcript")
             self.assertEqual(storage.read_text("job-1", WEB_SUMMARY_FILENAME, video_id="abc123"), "Legacy summary")
 
-    @mock.patch("cill.storage.requests.get")
-    @mock.patch("cill.storage.vercel_blob")
+    @mock.patch("cill.storage.vercel_put")
+    @mock.patch("cill.storage.vercel_get")
+    @mock.patch("cill.storage.vercel_list_objects")
     def test_blob_storage_reads_and_writes_job_artifacts(
         self,
-        vercel_blob_mock: mock.Mock,
-        requests_get_mock: mock.Mock,
+        vercel_list_objects_mock: mock.Mock,
+        vercel_get_mock: mock.Mock,
+        vercel_put_mock: mock.Mock,
     ) -> None:
-        requests_put_mock = mock.Mock()
-        requests_get_mock.return_value = mock.Mock(
-            text='{"status":"idle"}',
-            raise_for_status=mock.Mock(),
-        )
-        vercel_blob_mock.list.return_value = {
-            "blobs": [
-                {
-                    "pathname": "prefix/jobs/job-1/meta.json",
-                    "url": "https://blob.example/meta.json",
-                }
+        vercel_get_mock.return_value = SimpleNamespace(content=b'{"status":"idle"}')
+        vercel_list_objects_mock.return_value = SimpleNamespace(
+            blobs=[
+                SimpleNamespace(
+                    pathname="prefix/jobs/job-1/meta.json",
+                    url="https://blob.example/meta.json",
+                    uploaded_at=datetime(2026, 3, 29, 10, 0, 0, tzinfo=timezone.utc),
+                )
             ]
-        }
-
-        with mock.patch("cill.storage.requests.put", requests_put_mock):
-            requests_put_mock.return_value = mock.Mock(raise_for_status=mock.Mock())
-            storage = BlobStorageBackend(prefix="prefix", token="test-token")
-            state = storage.load_state("job-1")
-
-            self.assertEqual(state, {"status": "idle"})
-            storage.write_text("job-1", WEB_TRANSCRIPT_FILENAME, "Transcript")
-
-        requests_put_mock.assert_called_with(
-            "https://blob.vercel-storage.com/",
-            params={"pathname": "prefix/jobs/job-1/transcript.txt"},
-            headers={
-                "access": "private",
-                "authorization": "Bearer test-token",
-                "x-api-version": "10",
-                "x-content-type": "text/plain",
-                "x-allow-overwrite": "1",
-            },
-            data=b"Transcript",
-            timeout=30,
         )
 
-    @mock.patch("cill.storage.requests.get")
-    @mock.patch("cill.storage.vercel_blob")
+        storage = BlobStorageBackend(prefix="prefix", token="test-token")
+        state = storage.load_state("job-1")
+
+        self.assertEqual(state, {"status": "idle"})
+        storage.write_text("job-1", WEB_TRANSCRIPT_FILENAME, "Transcript")
+
+        vercel_put_mock.assert_called_with(
+            "prefix/jobs/job-1/transcript.txt",
+            b"Transcript",
+            access="private",
+            content_type="text/plain",
+            overwrite=True,
+            token="test-token",
+        )
+
+    @mock.patch("cill.storage.vercel_get")
+    @mock.patch("cill.storage.vercel_list_objects")
     def test_blob_storage_reads_suffixed_private_blob_pathnames(
         self,
-        vercel_blob_mock: mock.Mock,
-        requests_get_mock: mock.Mock,
+        vercel_list_objects_mock: mock.Mock,
+        vercel_get_mock: mock.Mock,
     ) -> None:
-        requests_get_mock.return_value = mock.Mock(
-            text='{"status":"cache_hit"}',
-            raise_for_status=mock.Mock(),
-        )
-        vercel_blob_mock.list.return_value = {
-            "blobs": [
-                {
-                    "pathname": "prefix/jobs/job-1/meta-AbCd1234.json",
-                    "url": "https://blob.example/meta-suffixed.json",
-                    "uploadedAt": "2026-03-29T10:00:00.000Z",
-                }
+        vercel_get_mock.return_value = SimpleNamespace(content=b'{"status":"cache_hit"}')
+        vercel_list_objects_mock.return_value = SimpleNamespace(
+            blobs=[
+                SimpleNamespace(
+                    pathname="prefix/jobs/job-1/meta-AbCd1234.json",
+                    url="https://blob.example/meta-suffixed.json",
+                    uploaded_at=datetime(2026, 3, 29, 10, 0, 0, tzinfo=timezone.utc),
+                )
             ]
-        }
+        )
 
         storage = BlobStorageBackend(prefix="prefix", token="test-token")
         state = storage.load_state("job-1")

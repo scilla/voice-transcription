@@ -6,22 +6,21 @@ import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
-
-import requests
 
 try:  # pragma: no cover - depends on installed extras
-    import vercel_blob
+    from vercel.blob import get as vercel_get
+    from vercel.blob import list_objects as vercel_list_objects
+    from vercel.blob import put as vercel_put
 except ImportError:  # pragma: no cover - depends on installed extras
-    vercel_blob = None
+    vercel_get = None
+    vercel_list_objects = None
+    vercel_put = None
 
 
 LOCAL_WEB_CACHE_DIRNAME = "web-cache"
 WEB_STATE_FILENAME = "meta.json"
 WEB_TRANSCRIPT_FILENAME = "transcript.txt"
 WEB_SUMMARY_FILENAME = "summary.txt"
-VERCEL_BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
-VERCEL_BLOB_API_VERSION = "10"
 
 
 class StorageBackend(ABC):
@@ -179,8 +178,8 @@ class LocalStorageBackend(StorageBackend):
 
 class BlobStorageBackend(StorageBackend):
     def __init__(self, prefix: str = "cill-web", token: Optional[str] = None) -> None:
-        if vercel_blob is None:  # pragma: no cover - depends on installed extras
-            raise RuntimeError("vercel-blob is not installed")
+        if vercel_get is None or vercel_list_objects is None or vercel_put is None:  # pragma: no cover - depends on installed extras
+            raise RuntimeError("vercel Blob SDK dependencies are not installed")
 
         self.prefix = prefix.strip("/ ")
         self.token = token or os.getenv("BLOB_READ_WRITE_TOKEN")
@@ -194,9 +193,15 @@ class BlobStorageBackend(StorageBackend):
         return f"{self._job_prefix(job_id)}/{filename}"
 
     def _list_job_blobs(self, job_id: str) -> dict[str, dict[str, Any]]:
-        response = vercel_blob.list({"token": self.token, "prefix": self._job_prefix(job_id)})
-        blobs = response.get("blobs", [])
-        return {blob["pathname"]: blob for blob in blobs}
+        response = vercel_list_objects(token=self.token, prefix=self._job_prefix(job_id))
+        return {
+            blob.pathname: {
+                "pathname": blob.pathname,
+                "url": blob.url,
+                "uploadedAt": blob.uploaded_at.isoformat() if getattr(blob, "uploaded_at", None) else "",
+            }
+            for blob in response.blobs
+        }
 
     def _resolve_blob(self, blobs: dict[str, dict[str, Any]], job_id: str, filename: str) -> Optional[dict[str, Any]]:
         exact_pathname = self._pathname(job_id, filename)
@@ -218,37 +223,37 @@ class BlobStorageBackend(StorageBackend):
         matches.sort(key=lambda item: item.get("uploadedAt", ""), reverse=True)
         return matches[0]
 
-    def _read_blob_text(self, blob_url: str) -> str:
-        response = requests.get(blob_url, timeout=30)
-        response.raise_for_status()
-        return response.text
+    def _read_blob_text(self, pathname: str) -> str:
+        result = vercel_get(pathname, access="private", token=self.token, use_cache=False)
+        return result.content.decode("utf-8")
 
     def _put_private_blob(self, pathname: str, data: bytes, content_type: str) -> None:
-        response = requests.put(
-            f"{VERCEL_BLOB_API_BASE_URL}/",
-            params={"pathname": pathname},
-            headers={
-                "access": "private",
-                "authorization": f"Bearer {self.token}",
-                "x-api-version": VERCEL_BLOB_API_VERSION,
-                "x-content-type": content_type,
-                "x-allow-overwrite": "1",
-            },
-            data=data,
-            timeout=30,
+        vercel_put(
+            pathname,
+            data,
+            access="private",
+            content_type=content_type,
+            overwrite=True,
+            token=self.token,
         )
-        response.raise_for_status()
 
     def _list_all_job_blobs(self) -> list[dict[str, Any]]:
-        response = vercel_blob.list({"token": self.token, "prefix": f"{self.prefix}/jobs/"})
-        return response.get("blobs", [])
+        response = vercel_list_objects(token=self.token, prefix=f"{self.prefix}/jobs/")
+        return [
+            {
+                "pathname": blob.pathname,
+                "url": blob.url,
+                "uploadedAt": blob.uploaded_at.isoformat() if getattr(blob, "uploaded_at", None) else "",
+            }
+            for blob in response.blobs
+        ]
 
     def load_state(self, job_id: str) -> Optional[dict[str, Any]]:
         blobs = self._list_job_blobs(job_id)
         blob = self._resolve_blob(blobs, job_id, WEB_STATE_FILENAME)
         if not blob:
             return None
-        return json.loads(self._read_blob_text(blob["url"]))
+        return json.loads(self._read_blob_text(blob["pathname"]))
 
     def save_state(self, job_id: str, state: dict[str, Any]) -> None:
         self._put_private_blob(
@@ -262,7 +267,7 @@ class BlobStorageBackend(StorageBackend):
         blob = self._resolve_blob(blobs, job_id, filename)
         if not blob:
             return None
-        return self._read_blob_text(blob["url"])
+        return self._read_blob_text(blob["pathname"])
 
     def write_text(self, job_id: str, filename: str, value: str) -> None:
         self._put_private_blob(
@@ -298,8 +303,8 @@ class BlobStorageBackend(StorageBackend):
         states: list[dict[str, Any]] = []
         for blob in candidates.values():
             try:
-                states.append(json.loads(self._read_blob_text(blob["url"])))
-            except (KeyError, json.JSONDecodeError, requests.RequestException):
+                states.append(json.loads(self._read_blob_text(blob["pathname"])))
+            except (KeyError, json.JSONDecodeError):
                 continue
         return states
 
