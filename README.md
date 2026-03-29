@@ -158,9 +158,11 @@ The web app is FastAPI-based and is intended for Vercel deployment. v1 is intent
 - no live streams
 - no local file uploads
 - no ffmpeg/chunking in the web request path
+- no `yt-dlp` in the web app path
 - hard limit: 25 minutes for audio-based processing
 - hard limit: 20 MB downloaded audio size
 - optional RapidAPI subtitle lookup when `X_RAPIDAPI_KEY` is configured
+- RapidAPI is also used for metadata and audio URL selection in the web app
 - if subtitles are available and pass validation, the plain transcript branch can run even when the video is longer than 25 minutes
 - the diarized branch still requires audio processing and remains capped at 25 minutes
 
@@ -190,6 +192,7 @@ Any `*.localhost` hostname resolves locally in modern browsers, so you can test 
 - missing work stays idle until the user explicitly queues it
 - queue controls let the user request `Transcript only` or `Transcript + summary` independently for each branch
 - the worker downloads audio once, then computes only the explicitly requested missing branches
+- the web app no longer probes YouTube directly; it uses RapidAPI for metadata, subtitle lookup, and audio stream selection
 - if `X_RAPIDAPI_KEY` is configured, the worker also attempts a YouTube subtitle lookup, validates subtitle coverage/word density, and stores both the subtitle text and validation metadata
 - when validated subtitles are available, the plain branch can use them directly instead of running audio transcription
 - the diarized branch always requires audio and remains capped at 25 minutes

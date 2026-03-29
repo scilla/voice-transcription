@@ -2,7 +2,6 @@ openai
 python-dotenv
 fastapi
 uvicorn
-yt-dlp
 vercel-blob
 vercel
 requests

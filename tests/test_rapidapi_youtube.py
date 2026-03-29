@@ -136,3 +136,52 @@ Hello there
         validation = rapidapi_youtube.validate_subtitle_stats(stats)
 
         self.assertFalse(validation["usable"])
+
+    def test_live_status_from_details(self) -> None:
+        self.assertEqual(
+            rapidapi_youtube.live_status_from_details({"isLiveNow": True, "isLiveStream": True}),
+            "is_live",
+        )
+        self.assertEqual(
+            rapidapi_youtube.live_status_from_details({"isLiveNow": False, "isLiveStream": True}),
+            "was_live",
+        )
+        self.assertEqual(
+            rapidapi_youtube.live_status_from_details({"isLiveNow": False, "isLiveStream": False}),
+            "not_live",
+        )
+
+    def test_extract_and_choose_audio_track_prefers_original_non_drc(self) -> None:
+        details = {
+            "audios": {
+                "items": [
+                    {
+                        "url": "https://example.com/audio?xtags=acont%3Ddubbed-auto%3Alang%3Des",
+                        "extension": "m4a",
+                        "size": 200,
+                        "isDrc": False,
+                    },
+                    {
+                        "url": "https://example.com/audio?xtags=acont%3Doriginal%3Alang%3Den-US",
+                        "extension": "weba",
+                        "size": 180,
+                        "isDrc": False,
+                    },
+                    {
+                        "url": "https://example.com/audio?xtags=acont%3Doriginal%3Alang%3Den-US",
+                        "extension": "weba",
+                        "size": 150,
+                        "isDrc": True,
+                    },
+                ]
+            }
+        }
+
+        track = rapidapi_youtube.choose_audio_track(
+            rapidapi_youtube.extract_audio_tracks(details)
+        )
+
+        self.assertIsNotNone(track)
+        self.assertEqual(track["extension"], "weba")
+        self.assertTrue(track["is_original"])
+        self.assertFalse(track["is_drc"])

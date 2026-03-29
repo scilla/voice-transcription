@@ -6,8 +6,11 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+
+from cill.env import load_project_dotenv
 
 
 RAPIDAPI_HOST = os.getenv("CILL_RAPIDAPI_HOST", "youtube-media-downloader.p.rapidapi.com")
@@ -31,6 +34,7 @@ class RapidAPIYoutubeError(RuntimeError):
 
 
 def get_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
+    load_project_dotenv()
     if explicit_key:
         return explicit_key
     for env_name in KEY_ENV_NAMES:
@@ -269,3 +273,89 @@ def validate_subtitle_stats(stats: dict[str, Any]) -> dict[str, Any]:
     ):
         return {"usable": False, "reason": "subtitle_coverage_ratio_out_of_range"}
     return {"usable": True, "reason": "ok"}
+
+
+def channel_name_from_details(details: dict[str, Any]) -> Optional[str]:
+    channel = details.get("channel")
+    if isinstance(channel, dict):
+        name = channel.get("name")
+        if name:
+            return str(name)
+    uploader = details.get("uploader")
+    if uploader:
+        return str(uploader)
+    return None
+
+
+def live_status_from_details(details: dict[str, Any]) -> str:
+    if details.get("isLiveNow"):
+        return "is_live"
+    if details.get("isLiveStream"):
+        return "was_live"
+    return "not_live"
+
+
+def parse_xtags_from_url(url: str) -> dict[str, str]:
+    xtags_value = parse_qs(urlparse(url).query).get("xtags", [None])[0]
+    if not xtags_value:
+        return {}
+    tags: dict[str, str] = {}
+    for part in unquote(xtags_value).split(":"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        tags[key] = value
+    return tags
+
+
+def extract_audio_tracks(details: dict[str, Any]) -> list[dict[str, Any]]:
+    items = ((details.get("audios") or {}).get("items") or [])
+    tracks: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not url:
+            continue
+        xtags = parse_xtags_from_url(url)
+        size = item.get("size")
+        try:
+            size_int = int(size) if size is not None else None
+        except (TypeError, ValueError):
+            size_int = None
+        tracks.append(
+            {
+                "url": url,
+                "extension": item.get("extension"),
+                "mime_type": item.get("mimeType"),
+                "size": size_int,
+                "size_text": item.get("sizeText"),
+                "is_drc": bool(item.get("isDrc")),
+                "content_type": xtags.get("acont"),
+                "language": xtags.get("lang"),
+                "is_original": xtags.get("acont") == "original",
+            }
+        )
+    return tracks
+
+
+def choose_audio_track(
+    tracks: list[dict[str, Any]],
+    *,
+    preferred_extensions: tuple[str, ...] = ("weba", "m4a", "mp3", "ogg", "aac"),
+) -> Optional[dict[str, Any]]:
+    if not tracks:
+        return None
+
+    def sort_key(track: dict[str, Any]) -> tuple[int, int, int, int]:
+        extension = str(track.get("extension") or "")
+        try:
+            extension_rank = preferred_extensions.index(extension)
+        except ValueError:
+            extension_rank = len(preferred_extensions) + 1
+        original_rank = 0 if track.get("is_original") else 1
+        drc_rank = 1 if track.get("is_drc") else 0
+        size_rank = int(track.get("size") or 10**12)
+        return (original_rank, drc_rank, extension_rank, size_rank)
+
+    return sorted(tracks, key=sort_key)[0]

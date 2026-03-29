@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import requests
 import shutil
 import tempfile
 import threading
@@ -16,7 +17,6 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-from yt_dlp import DownloadError, YoutubeDL
 
 import speech
 from cill import rapidapi_youtube
@@ -46,10 +46,6 @@ QUEUED_STATUSES = {"queued"}
 MAX_VIDEO_SECONDS = int(os.getenv("CILL_MAX_VIDEO_SECONDS", str(25 * 60)))
 MAX_AUDIO_BYTES = int(os.getenv("CILL_MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
 SUPPORTED_WEB_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".webm", ".wav", ".ogg", ".aac", ".mpeg", ".mpga"}
-YTDLP_WEB_FORMAT = (
-    "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio[ext=webm]/"
-    "bestaudio[ext=ogg]/bestaudio[acodec!=none]/bestaudio"
-)
 VARIANT_DEFINITIONS = {
     "plain": {
         "label": "Plain transcript",
@@ -85,6 +81,10 @@ FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" rol
 
 app = FastAPI(title="cill.app transcript viewer")
 storage = create_storage_backend()
+
+
+class AudioTooLargeError(RuntimeError):
+    pass
 
 
 class JobCreateRequest(BaseModel):
@@ -329,6 +329,8 @@ def update_state(state: dict[str, Any], *, status: Optional[str] = None, error: 
 def parse_duration_seconds(metadata: dict[str, Any]) -> Optional[float]:
     value = metadata.get("duration")
     if value is None:
+        value = metadata.get("lengthSeconds")
+    if value is None:
         return None
     try:
         return float(value)
@@ -350,26 +352,37 @@ def build_source_context(state: dict[str, Any], audio_path: str) -> dict[str, An
 
 
 def probe_youtube_metadata(source_url: str) -> dict[str, Any]:
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "cachedir": False,
+    video_id = extract_youtube_video_id(source_url)
+    if not video_id:
+        raise RuntimeError("Unable to extract a YouTube video ID from the URL.")
+    client = rapidapi_youtube.RapidAPIYoutubeClient.from_env()
+    details = client.get_video_details(video_id)
+    return {
+        "id": details.get("id") or video_id,
+        "title": details.get("title"),
+        "uploader": rapidapi_youtube.channel_name_from_details(details),
+        "duration": details.get("lengthSeconds"),
+        "live_status": rapidapi_youtube.live_status_from_details(details),
+        "rapidapi_details": details,
     }
-    with YoutubeDL(options) as ydl:
-        return ydl.extract_info(source_url, download=False)
 
 
-def maybe_fetch_rapidapi_subtitles(state: dict[str, Any], duration_seconds: Optional[float]) -> dict[str, Any]:
+def maybe_fetch_rapidapi_subtitles(
+    state: dict[str, Any],
+    duration_seconds: Optional[float],
+    *,
+    details: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     rapidapi_state = ensure_rapidapi_state(state)
     if rapidapi_state.get("subtitle_fetched") or not rapidapi_youtube.is_configured():
         rapidapi_state["configured"] = rapidapi_youtube.is_configured()
         return state
 
     try:
-        client = rapidapi_youtube.RapidAPIYoutubeClient.from_env()
-        details = client.get_video_details(state["video_id"])
+        client = None
+        if details is None:
+            client = rapidapi_youtube.RapidAPIYoutubeClient.from_env()
+            details = client.get_video_details(state["video_id"])
         track = rapidapi_youtube.choose_subtitle_track(
             rapidapi_youtube.extract_subtitle_tracks(details)
         )
@@ -384,6 +397,8 @@ def maybe_fetch_rapidapi_subtitles(state: dict[str, Any], duration_seconds: Opti
             )
             return persist_state(state)
 
+        if client is None:
+            client = rapidapi_youtube.RapidAPIYoutubeClient.from_env()
         subtitle_text = rapidapi_youtube.normalize_subtitle_text(
             client.get_subtitle_text(track["url"], format="srt", fix_overlap=True)
         )
@@ -613,45 +628,52 @@ def variant_needs_work(variant: dict[str, Any]) -> bool:
     return False
 
 
+def build_audio_download_selection(video_id: str) -> dict[str, Any]:
+    client = rapidapi_youtube.RapidAPIYoutubeClient.from_env()
+    details = client.get_video_details(video_id, subtitles=False)
+    track = rapidapi_youtube.choose_audio_track(
+        rapidapi_youtube.extract_audio_tracks(details)
+    )
+    if not track or not track.get("url"):
+        raise RuntimeError("RapidAPI did not provide a downloadable audio stream for this video.")
+    return track
+
+
 def download_audio(source_url: str, state: dict[str, Any]) -> tuple[str, bool]:
     cached_audio = storage.find_cached_audio(state["video_id"])
     if cached_audio:
         return cached_audio, False
 
     temp_dir = tempfile.mkdtemp(prefix=f"cill_{state['video_id']}_")
-    output_template = os.path.join(
-        temp_dir,
-        f"{sanitize_filename_component(state['title'])} [{state['video_id']}].%(ext)s",
-    )
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "cachedir": False,
-        "format": YTDLP_WEB_FORMAT,
-        "outtmpl": output_template,
-        "overwrites": True,
-    }
-
-    try:
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(source_url, download=True)
-    except DownloadError as exc:
+    track = build_audio_download_selection(state["video_id"])
+    track_size = track.get("size")
+    if track_size and int(track_size) > MAX_AUDIO_BYTES:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        raise RuntimeError(f"Unable to download YouTube audio: {exc}") from exc
+        raise AudioTooLargeError(
+            f"Downloaded audio exceeds the v1 size cap of {MAX_AUDIO_BYTES // (1024 * 1024)} MB."
+        )
 
-    requested = info.get("requested_downloads", [])
-    for item in requested:
-        filepath = item.get("filepath")
-        if filepath and os.path.exists(filepath):
-            return filepath, True
+    extension = str(track.get("extension") or "bin").strip(".")
+    target_path = Path(temp_dir) / f"{sanitize_filename_component(state['title'])} [{state['video_id']}].{extension}"
+    try:
+        with requests.get(track["url"], stream=True, timeout=60) as response:
+            response.raise_for_status()
+            total_bytes = 0
+            with open(target_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_AUDIO_BYTES:
+                        raise AudioTooLargeError(
+                            f"Downloaded audio exceeds the v1 size cap of {MAX_AUDIO_BYTES // (1024 * 1024)} MB."
+                        )
+                    handle.write(chunk)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
-    fallback = find_downloaded_file(temp_dir, state["video_id"])
-    if fallback:
-        return fallback, True
-
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    raise RuntimeError("yt_dlp completed but no downloadable audio file was found")
+    return str(target_path), True
 
 
 def hydrate_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -755,15 +777,33 @@ def persist_state(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+def handle_probe_failure(state: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    hydrated = hydrate_state(state)
+    rapidapi_state = ensure_rapidapi_state(hydrated)
+    rapidapi_state["configured"] = rapidapi_youtube.is_configured()
+    rapidapi_state["error"] = str(exc)
+    if any_variant_output(hydrated):
+        return hydrate_state(persist_state(hydrated))
+    return hydrate_state(
+        persist_state(
+            update_state(
+                hydrated,
+                status="error",
+                error=f"The deployment could not access YouTube metadata from RapidAPI: {exc}",
+            )
+        )
+    )
+
+
 def probe_job_state(state: dict[str, Any]) -> dict[str, Any]:
     metadata = probe_youtube_metadata(state["source_url"])
     state["title"] = metadata.get("title") or state.get("title") or "Unknown"
-    state["uploader"] = metadata.get("channel") or metadata.get("uploader") or state.get("uploader") or "Unknown"
+    state["uploader"] = metadata.get("uploader") or state.get("uploader") or "Unknown"
     state["duration_seconds"] = parse_duration_seconds(metadata)
+    state["live_status"] = metadata.get("live_status")
     persist_state(update_state(state, status=state.get("status") or "idle", error=None))
 
     live_status = classify_youtube_live_status(metadata)
-    state["live_status"] = live_status
     if live_status != "not_live":
         persist_state(
             update_state(
@@ -775,7 +815,11 @@ def probe_job_state(state: dict[str, Any]) -> dict[str, Any]:
         return hydrate_state(state)
 
     duration_seconds = state["duration_seconds"]
-    maybe_fetch_rapidapi_subtitles(state, duration_seconds)
+    maybe_fetch_rapidapi_subtitles(
+        state,
+        duration_seconds,
+        details=metadata.get("rapidapi_details"),
+    )
     subtitle_usable, _ = get_subtitle_validation(state)
     duration_exceeds_limit = duration_seconds is None or duration_seconds > MAX_VIDEO_SECONDS
     if duration_exceeds_limit and not subtitle_usable:
@@ -833,7 +877,11 @@ def process_job(state: dict[str, Any]) -> dict[str, Any]:
 
         if needs_audio_download:
             persist_state(update_state(hydrated, status="downloading"))
-            audio_path, cleanup_temp_dir = download_audio(hydrated["source_url"], hydrated)
+            try:
+                audio_path, cleanup_temp_dir = download_audio(hydrated["source_url"], hydrated)
+            except AudioTooLargeError as exc:
+                persist_state(update_state(hydrated, status="unsupported_size", error=str(exc)))
+                return hydrate_state(hydrated)
             extension = Path(audio_path).suffix.lower()
             if extension not in SUPPORTED_WEB_AUDIO_EXTENSIONS:
                 persist_state(update_state(hydrated, status="error", error=f"Unsupported audio format: {extension}"))
@@ -992,8 +1040,8 @@ def create_or_reuse_job(source_url: str) -> dict[str, Any]:
         ):
             try:
                 return probe_job_state(hydrated)
-            except Exception:
-                return hydrate_state(hydrated)
+            except Exception as exc:
+                return handle_probe_failure(hydrated, exc)
         return hydrated
 
     cached_plain_transcript = storage.read_text(job_id, WEB_TRANSCRIPT_FILENAME, video_id=video_id)
@@ -1025,14 +1073,14 @@ def create_or_reuse_job(source_url: str) -> dict[str, Any]:
             cached_state["status"] = "idle"
         try:
             return probe_job_state(persist_state(cached_state))
-        except Exception:
-            return hydrate_state(persist_state(cached_state))
+        except Exception as exc:
+            return handle_probe_failure(persist_state(cached_state), exc)
 
     fresh_state = persist_state(idle_job_state(source_url, video_id))
     try:
         return probe_job_state(fresh_state)
-    except Exception:
-        return hydrate_state(fresh_state)
+    except Exception as exc:
+        return handle_probe_failure(fresh_state, exc)
 
 
 def queue_requested_work(state: dict[str, Any], payload: JobRunRequest) -> dict[str, Any]:

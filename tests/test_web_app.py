@@ -301,7 +301,7 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(state["status"], "unsupported_live")
 
-    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles", side_effect=lambda state, duration_seconds: state)
+    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles", side_effect=lambda state, duration_seconds, **kwargs: state)
     @mock.patch("cill.app.probe_youtube_metadata")
     def test_process_job_rejects_over_duration(self, probe_mock: mock.Mock, subtitle_mock: mock.Mock) -> None:
         probe_mock.return_value = {
@@ -349,7 +349,7 @@ class WebAppTests(unittest.TestCase):
                 audio_dir=str(Path(temp_dir) / "audio"),
             )
 
-            def subtitle_side_effect(state: dict, duration_seconds: float | None) -> dict:
+            def subtitle_side_effect(state: dict, duration_seconds: float | None, **kwargs) -> dict:
                 subtitle_text = "Subtitle transcript line one.\nSubtitle transcript line two."
                 subtitle_metadata = {
                     "selected_track": {"code": "en", "kind": None},
@@ -487,7 +487,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(observed_statuses[-1], "complete")
 
     @mock.patch("cill.app.download_audio")
-    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles", side_effect=lambda state, duration_seconds: state)
+    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles", side_effect=lambda state, duration_seconds, **kwargs: state)
     @mock.patch("cill.app.probe_youtube_metadata")
     @mock.patch("cill.app.speech.summarize_transcript")
     @mock.patch("cill.app.speech.transcribe_audio_file")
@@ -730,3 +730,17 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(processed, 1)
         process_job_mock.assert_called_once()
+    @mock.patch("cill.app.probe_youtube_metadata", side_effect=RuntimeError("rapidapi failed"))
+    def test_create_or_reuse_job_returns_error_on_probe_failure(self, probe_mock: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            with mock.patch("cill.app.storage", storage):
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
+
+        self.assertEqual(state["status"], "error")
+        self.assertIn("RapidAPI", state["error"])
+        self.assertIn("rapidapi failed", state["error"])
+        probe_mock.assert_called_once()
