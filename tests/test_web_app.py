@@ -91,6 +91,32 @@ class WebAppTests(unittest.TestCase):
             {"token": "test-token", "allowOverwrite": True, "addRandomSuffix": False},
         )
 
+    @mock.patch("cill.storage.requests.get")
+    @mock.patch("cill.storage.vercel_blob")
+    def test_blob_storage_reads_suffixed_private_blob_pathnames(
+        self,
+        vercel_blob_mock: mock.Mock,
+        requests_get_mock: mock.Mock,
+    ) -> None:
+        requests_get_mock.return_value = mock.Mock(
+            text='{"status":"cache_hit"}',
+            raise_for_status=mock.Mock(),
+        )
+        vercel_blob_mock.list.return_value = {
+            "blobs": [
+                {
+                    "pathname": "prefix/jobs/job-1/meta-AbCd1234.json",
+                    "url": "https://blob.example/meta-suffixed.json",
+                    "uploadedAt": "2026-03-29T10:00:00.000Z",
+                }
+            ]
+        }
+
+        storage = BlobStorageBackend(prefix="prefix", token="test-token")
+        state = storage.load_state("job-1")
+
+        self.assertEqual(state, {"status": "cache_hit"})
+
     @mock.patch("cill.app.probe_youtube_metadata")
     def test_create_or_reuse_job_uses_cached_local_outputs(self, probe_mock: mock.Mock) -> None:
         probe_mock.return_value = {

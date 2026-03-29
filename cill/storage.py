@@ -178,6 +178,26 @@ class BlobStorageBackend(StorageBackend):
         blobs = response.get("blobs", [])
         return {blob["pathname"]: blob for blob in blobs}
 
+    def _resolve_blob(self, blobs: dict[str, dict[str, Any]], job_id: str, filename: str) -> Optional[dict[str, Any]]:
+        exact_pathname = self._pathname(job_id, filename)
+        blob = blobs.get(exact_pathname)
+        if blob:
+            return blob
+
+        path = Path(filename)
+        stem_prefix = f"{self._job_prefix(job_id)}/{path.stem}-"
+        suffix = path.suffix
+        matches = [
+            candidate
+            for pathname, candidate in blobs.items()
+            if pathname.startswith(stem_prefix) and pathname.endswith(suffix)
+        ]
+        if not matches:
+            return None
+
+        matches.sort(key=lambda item: item.get("uploadedAt", ""), reverse=True)
+        return matches[0]
+
     def _read_blob_text(self, blob_url: str) -> str:
         response = requests.get(blob_url, timeout=30)
         response.raise_for_status()
@@ -185,7 +205,7 @@ class BlobStorageBackend(StorageBackend):
 
     def load_state(self, job_id: str) -> Optional[dict[str, Any]]:
         blobs = self._list_job_blobs(job_id)
-        blob = blobs.get(self._pathname(job_id, WEB_STATE_FILENAME))
+        blob = self._resolve_blob(blobs, job_id, WEB_STATE_FILENAME)
         if not blob:
             return None
         return json.loads(self._read_blob_text(blob["url"]))
@@ -199,7 +219,7 @@ class BlobStorageBackend(StorageBackend):
 
     def read_text(self, job_id: str, filename: str, video_id: Optional[str] = None) -> Optional[str]:
         blobs = self._list_job_blobs(job_id)
-        blob = blobs.get(self._pathname(job_id, filename))
+        blob = self._resolve_blob(blobs, job_id, filename)
         if not blob:
             return None
         return self._read_blob_text(blob["url"])
