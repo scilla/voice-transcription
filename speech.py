@@ -13,6 +13,8 @@ import tempfile
 import time
 from typing import Optional
 
+from pydantic import BaseModel, Field
+
 try:
     import dotenv
 except ImportError:  # pragma: no cover - depends on local environment
@@ -69,6 +71,12 @@ DIRECT_AUDIO_EXTENSIONS = {".mp3", ".opus", ".wav", ".m4a", ".aac", ".flac", ".o
 YOUTUBE_UPCOMING_STATUSES = {"is_upcoming"}
 YOUTUBE_ACTIVE_LIVE_STATUSES = {"is_live"}
 VERBOSE = False
+
+
+class SummaryPayload(BaseModel):
+    overview: str = Field(description="A concise 2-4 sentence overview of the transcript.")
+    key_points: list[str] = Field(description="4-6 concrete factual bullet points.")
+    notable_takeaways: list[str] = Field(description="3-5 important conclusions or implications.")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -968,38 +976,86 @@ def extract_transcript_text_from_output(output_path: str) -> str:
     return content
 
 
+def clean_summary_bullets(values: list[str], *, min_items: int, max_items: int) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = re.sub(r"\s+", " ", (value or "").strip()).strip("-*• ")
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(normalized)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned[:max_items] if len(cleaned) >= min_items else cleaned
+
+
+def format_structured_summary(payload: SummaryPayload) -> str:
+    overview = re.sub(r"\s+", " ", payload.overview.strip())
+    key_points = clean_summary_bullets(payload.key_points, min_items=1, max_items=6)
+    takeaways = clean_summary_bullets(payload.notable_takeaways, min_items=1, max_items=5)
+
+    lines = [
+        "Overview",
+        overview or "No overview available.",
+        "",
+        "Key Points",
+    ]
+    lines.extend(f"- {item}" for item in key_points or ["No key points available."])
+    lines.extend(
+        [
+            "",
+            "Notable Takeaways",
+        ]
+    )
+    lines.extend(f"- {item}" for item in takeaways or ["No notable takeaways available."])
+    return "\n".join(lines).strip()
+
+
+def build_summary_messages(transcript_text: str, source_context: dict) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You summarize video transcripts into a strict structure. "
+                "Return factual content only. "
+                "Write an overview of 2 to 4 sentences. "
+                "Return 4 to 6 key points, each as a single specific sentence fragment without numbering. "
+                "Return 3 to 5 notable takeaways, each as a single specific sentence fragment without numbering. "
+                "Do not include markdown, headings, or extra commentary in the structured fields."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{describe_source_for_summary(source_context)}\n\n"
+                "Summarize the following transcript. "
+                "Be specific about claims, technologies, people, products, dates, and outcomes when they appear in the transcript.\n\n"
+                f"{transcript_text}"
+            ),
+        },
+    ]
+
+
 def summarize_transcript(transcript_text: str, source_context: dict) -> str:
     client = get_openai_client()
     log_verbose(
         "Submitting summary request "
         f"model={get_summary_model_name()} transcript_chars={len(transcript_text)}"
     )
-    response = client.chat.completions.create(
+    messages = build_summary_messages(transcript_text, source_context)
+    response = client.beta.chat.completions.parse(
         model=get_summary_model_name(),
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You summarize video transcripts. Return a concise summary with these headings: "
-                    "Overview, Key Points, and Notable Takeaways."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"{describe_source_for_summary(source_context)}\n\n"
-                    "Summarize the following transcript.\n\n"
-                    f"{transcript_text}"
-                ),
-            },
-        ],
+        messages=messages,
+        response_format=SummaryPayload,
     )
-    content = response.choices[0].message.content
-    if isinstance(content, list):
-        return "\n".join(
-            part.text for part in content if getattr(part, "type", None) == "text" and getattr(part, "text", None)
-        ).strip()
-    return (content or "").strip()
+    parsed = response.choices[0].message.parsed
+    if parsed is None:  # pragma: no cover - network dependent
+        raise RuntimeError("Summary response did not include parsed structured output.")
+    return format_structured_summary(parsed)
 
 
 def write_summary_output(

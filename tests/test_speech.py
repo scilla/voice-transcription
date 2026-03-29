@@ -392,11 +392,42 @@ class SpeechTests(unittest.TestCase):
         self.assertIn("live video", description)
         self.assertIn("available at request time", description)
 
-    def test_summarize_transcript_includes_live_context_in_prompt(self) -> None:
+    def test_format_structured_summary_is_uniform(self) -> None:
+        formatted = speech.format_structured_summary(
+            speech.SummaryPayload(
+                overview="A compact overview.",
+                key_points=["Point one", "Point two"],
+                notable_takeaways=["Takeaway one", "Takeaway two"],
+            )
+        )
+
+        self.assertEqual(
+            formatted,
+            "Overview\n"
+            "A compact overview.\n\n"
+            "Key Points\n"
+            "- Point one\n"
+            "- Point two\n\n"
+            "Notable Takeaways\n"
+            "- Takeaway one\n"
+            "- Takeaway two",
+        )
+
+    def test_summarize_transcript_uses_structured_output_and_live_context(self) -> None:
         client_mock = mock.Mock()
-        create_mock = client_mock.chat.completions.create
-        create_mock.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Summary text"))]
+        parse_mock = client_mock.beta.chat.completions.parse
+        parse_mock.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        parsed=speech.SummaryPayload(
+                            overview="A concise overview.",
+                            key_points=["Point one", "Point two"],
+                            notable_takeaways=["Takeaway one", "Takeaway two"],
+                        )
+                    )
+                )
+            ]
         )
 
         with mock.patch("speech.get_openai_client", return_value=client_mock):
@@ -409,11 +440,14 @@ class SpeechTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(summary, "Summary text")
-        _, kwargs = create_mock.call_args
+        self.assertIn("Overview\nA concise overview.", summary)
+        self.assertIn("Key Points\n- Point one\n- Point two", summary)
+        self.assertIn("Notable Takeaways\n- Takeaway one\n- Takeaway two", summary)
+        _, kwargs = parse_mock.call_args
         user_prompt = kwargs["messages"][1]["content"]
         self.assertIn("reached the requested timeout", user_prompt)
         self.assertIn("Transcript body", user_prompt)
+        self.assertIs(kwargs["response_format"], speech.SummaryPayload)
 
     def test_output_header_contains_youtube_metadata(self) -> None:
         header = speech.build_output_header(
