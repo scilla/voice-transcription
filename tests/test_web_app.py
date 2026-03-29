@@ -662,7 +662,8 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(payload["video_id"], self.VIDEO_ID)
         self.assertIsNone(payload["error"])
 
-    def test_run_endpoint_queues_selected_plain_variant_only(self) -> None:
+    @mock.patch("cill.app.process_job")
+    def test_run_endpoint_queues_selected_plain_variant_only(self, process_job_mock: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = LocalStorageBackend(
                 output_dir=str(Path(temp_dir) / "output"),
@@ -685,6 +686,7 @@ class WebAppTests(unittest.TestCase):
                 "updated_at": "now",
             }
             storage.save_state("job123", initial_state)
+            process_job_mock.side_effect = lambda state: state
 
             with mock.patch("cill.app.storage", storage):
                 client = TestClient(app)
@@ -702,6 +704,77 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(payload["variants"]["plain"]["requested_transcript"])
         self.assertTrue(payload["variants"]["plain"]["requested_summary"])
         self.assertEqual(payload["variants"]["diarized"]["status"], "idle")
+
+    @mock.patch("cill.app.process_job")
+    def test_run_endpoint_executes_remote_processing(self, process_job_mock: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            initial_state = {
+                "job_id": "job123",
+                "cache_key": f"youtube:{self.VIDEO_ID}:plain:auto",
+                "source_url": f"https://youtube.com/watch?v={self.VIDEO_ID}",
+                "video_id": self.VIDEO_ID,
+                "title": "Video",
+                "uploader": "Uploader",
+                "duration_seconds": 120,
+                "live_status": "not_live",
+                "status": "idle",
+                "error": None,
+                "transcript_ready": False,
+                "summary_ready": False,
+                "created_at": "now",
+                "updated_at": "now",
+            }
+            storage.save_state("job123", initial_state)
+            process_job_mock.return_value = {
+                **initial_state,
+                "status": "complete",
+                "variants": {
+                    "plain": {
+                        "name": "plain",
+                        "label": "Plain transcript",
+                        "diarize": False,
+                        "status": "complete",
+                        "error": None,
+                        "requested_transcript": False,
+                        "requested_summary": False,
+                        "transcript_ready": True,
+                        "summary_ready": True,
+                        "transcript_source": "rapidapi_subtitles",
+                        "summary_basis": "rapidapi_subtitles",
+                    },
+                    "diarized": {
+                        "name": "diarized",
+                        "label": "Diarized transcript",
+                        "diarize": True,
+                        "status": "idle",
+                        "error": None,
+                        "requested_transcript": False,
+                        "requested_summary": False,
+                        "transcript_ready": False,
+                        "summary_ready": False,
+                        "transcript_source": None,
+                        "summary_basis": None,
+                    },
+                },
+            }
+
+            with mock.patch("cill.app.storage", storage):
+                client = TestClient(app)
+                response = client.post(
+                    "/api/jobs/job123/run",
+                    json={
+                        "plain": {"transcript": True, "summary": True},
+                        "diarized": {"transcript": False, "summary": False},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "complete")
+        process_job_mock.assert_called_once()
 
     def test_processing_page_renders_manual_queue_controls(self) -> None:
         client = TestClient(app)

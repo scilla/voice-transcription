@@ -1923,10 +1923,15 @@ def run_job(job_id: str, payload: JobRunRequest) -> JSONResponse:
     if not state:
         raise HTTPException(status_code=404, detail="Job not found.")
     hydrated = recover_stale_active_state(state)
-    if hydrated["status"] in TERMINAL_STATUSES or hydrated["status"] in ACTIVE_STATUSES:
-        if hydrated["status"] in ACTIVE_STATUSES:
-            return JSONResponse(hydrate_state(hydrated))
-    return JSONResponse(queue_requested_work(hydrated, payload))
+    if hydrated["status"] in TERMINAL_STATUSES:
+        return JSONResponse(hydrate_state(hydrated))
+    if hydrated["status"] in ACTIVE_STATUSES:
+        return JSONResponse(hydrate_state(hydrated))
+
+    queued = queue_requested_work(hydrated, payload)
+    if queued["status"] != "queued":
+        return JSONResponse(hydrate_state(queued))
+    return JSONResponse(process_job(queued))
 
 
 @app.get("/", response_class=HTMLResponse)
