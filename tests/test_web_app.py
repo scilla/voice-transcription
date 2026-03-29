@@ -16,6 +16,8 @@ from cill.app import (
     VariantRunRequest,
     app,
     create_or_reuse_job,
+    make_cache_key,
+    make_job_id,
     process_job,
     queue_requested_work,
     reconstruct_source_url,
@@ -209,6 +211,69 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(state["variants"]["diarized"]["transcript"], "Cached diarized transcript")
         self.assertEqual(state["variants"]["diarized"]["summary"], "Cached diarized summary")
         probe_mock.assert_called_once()
+
+    def test_create_or_reuse_job_recovers_stale_downloading_state(self) -> None:
+        stale_timestamp = "2026-03-29T16:00:00+00:00"
+        job_id = make_job_id(make_cache_key(self.VIDEO_ID))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            storage.save_state(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "cache_key": f"youtube:{self.VIDEO_ID}:plain:auto",
+                    "source_url": f"https://youtube.com/watch?v={self.VIDEO_ID}",
+                    "video_id": self.VIDEO_ID,
+                    "title": "Video",
+                    "uploader": "Uploader",
+                    "duration_seconds": 120,
+                    "live_status": "not_live",
+                    "status": "downloading",
+                    "error": None,
+                    "created_at": stale_timestamp,
+                    "updated_at": stale_timestamp,
+                    "rapidapi": {"configured": True, "subtitle_fetched": True},
+                    "variants": {
+                        "plain": {
+                            "name": "plain",
+                            "label": "Plain transcript",
+                            "diarize": False,
+                            "status": "queued",
+                            "error": None,
+                            "requested_transcript": True,
+                            "requested_summary": True,
+                            "transcript_ready": False,
+                            "summary_ready": False,
+                            "transcript_source": None,
+                            "summary_basis": None,
+                        },
+                        "diarized": {
+                            "name": "diarized",
+                            "label": "Diarized transcript",
+                            "diarize": True,
+                            "status": "idle",
+                            "error": None,
+                            "requested_transcript": False,
+                            "requested_summary": False,
+                            "transcript_ready": False,
+                            "summary_ready": False,
+                            "transcript_source": None,
+                            "summary_basis": None,
+                        },
+                    },
+                },
+            )
+
+            with mock.patch("cill.app.storage", storage):
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
+
+        self.assertEqual(state["status"], "queued")
+        self.assertEqual(state["variants"]["plain"]["status"], "queued")
+        self.assertTrue(state["variants"]["plain"]["requested_transcript"])
+        self.assertTrue(state["variants"]["plain"]["requested_summary"])
 
     @mock.patch("cill.app.probe_youtube_metadata", side_effect=RuntimeError("blocked"))
     def test_process_job_returns_error_state_when_metadata_probe_fails(self, probe_mock: mock.Mock) -> None:
@@ -730,6 +795,67 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(processed, 1)
         process_job_mock.assert_called_once()
+
+    @mock.patch("cill.worker.process_job")
+    def test_worker_requeues_interrupted_job(self, process_job_mock: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            queued_state = {
+                "job_id": "queued-job",
+                "status": "queued",
+                "source_url": f"https://youtube.com/watch?v={self.VIDEO_ID}",
+                "created_at": "2026-03-29T17:00:00+00:00",
+                "updated_at": "2026-03-29T17:00:00+00:00",
+                "variants": {
+                    "plain": {
+                        "name": "plain",
+                        "label": "Plain transcript",
+                        "diarize": False,
+                        "status": "queued",
+                        "error": None,
+                        "requested_transcript": True,
+                        "requested_summary": False,
+                        "transcript_ready": False,
+                        "summary_ready": False,
+                        "transcript_source": None,
+                        "summary_basis": None,
+                    },
+                    "diarized": {
+                        "name": "diarized",
+                        "label": "Diarized transcript",
+                        "diarize": True,
+                        "status": "idle",
+                        "error": None,
+                        "requested_transcript": False,
+                        "requested_summary": False,
+                        "transcript_ready": False,
+                        "summary_ready": False,
+                        "transcript_source": None,
+                        "summary_basis": None,
+                    },
+                },
+            }
+            storage.save_state("queued-job", queued_state)
+
+            def interrupting_process(state: dict) -> dict:
+                downloading_state = dict(state)
+                downloading_state["status"] = "downloading"
+                downloading_state["updated_at"] = "2026-03-29T17:05:00+00:00"
+                storage.save_state("queued-job", downloading_state)
+                raise KeyboardInterrupt
+
+            process_job_mock.side_effect = interrupting_process
+
+            with mock.patch("cill.worker.storage", storage):
+                with mock.patch("cill.app.storage", storage):
+                    with self.assertRaises(KeyboardInterrupt):
+                        process_pending_jobs()
+                    recovered = storage.load_state("queued-job")
+
+        self.assertEqual(recovered["status"], "queued")
     @mock.patch("cill.app.probe_youtube_metadata", side_effect=RuntimeError("rapidapi failed"))
     def test_create_or_reuse_job_returns_error_on_probe_failure(self, probe_mock: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

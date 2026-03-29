@@ -9,6 +9,7 @@ import requests
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -45,6 +46,10 @@ ACTIVE_STATUSES = {"downloading", "transcribing", "summarizing"}
 QUEUED_STATUSES = {"queued"}
 MAX_VIDEO_SECONDS = int(os.getenv("CILL_MAX_VIDEO_SECONDS", str(25 * 60)))
 MAX_AUDIO_BYTES = int(os.getenv("CILL_MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
+DOWNLOAD_CONNECT_TIMEOUT_SECONDS = float(os.getenv("CILL_AUDIO_DOWNLOAD_CONNECT_TIMEOUT_SECONDS", "10"))
+DOWNLOAD_READ_TIMEOUT_SECONDS = float(os.getenv("CILL_AUDIO_DOWNLOAD_READ_TIMEOUT_SECONDS", "20"))
+DOWNLOAD_DEADLINE_SECONDS = float(os.getenv("CILL_AUDIO_DOWNLOAD_DEADLINE_SECONDS", "180"))
+STALE_ACTIVE_JOB_SECONDS = float(os.getenv("CILL_STALE_ACTIVE_JOB_SECONDS", "300"))
 SUPPORTED_WEB_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".webm", ".wav", ".ogg", ".aac", ".mpeg", ".mpga"}
 VARIANT_DEFINITIONS = {
     "plain": {
@@ -338,6 +343,39 @@ def parse_duration_seconds(metadata: dict[str, Any]) -> Optional[float]:
         return None
 
 
+def parse_state_timestamp(value: Any) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def state_has_active_work(state: dict[str, Any]) -> bool:
+    if state.get("status") in ACTIVE_STATUSES:
+        return True
+    return any(
+        variant.get("status") in ACTIVE_STATUSES
+        for variant in ensure_variant_map(state).values()
+    )
+
+
+def is_stale_active_state(state: dict[str, Any]) -> bool:
+    if not state_has_active_work(state):
+        return False
+    updated_at = parse_state_timestamp(state.get("updated_at")) or parse_state_timestamp(
+        state.get("created_at")
+    )
+    if not updated_at:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    return age_seconds >= STALE_ACTIVE_JOB_SECONDS
+
+
 def build_source_context(state: dict[str, Any], audio_path: str) -> dict[str, Any]:
     return {
         "source_type": "youtube",
@@ -616,6 +654,35 @@ def update_variant_state(
     return state
 
 
+def requeue_pending_work(state: dict[str, Any]) -> dict[str, Any]:
+    hydrated = hydrate_state(state)
+    queued_any = False
+    for variant_name, variant in ensure_variant_map(hydrated).items():
+        needs_transcript = bool(variant.get("requested_transcript") and not variant.get("transcript_ready"))
+        needs_summary = bool(variant.get("requested_summary") and not variant.get("summary_ready"))
+        if not needs_transcript and not needs_summary:
+            continue
+        queued_any = True
+        update_variant_state(
+            hydrated,
+            variant_name,
+            status="queued",
+            error=None,
+            requested_transcript=needs_transcript,
+            requested_summary=needs_summary,
+        )
+    if queued_any:
+        update_state(hydrated, status="queued", error=None)
+    return hydrate_state(persist_state(hydrated))
+
+
+def recover_stale_active_state(state: dict[str, Any]) -> dict[str, Any]:
+    hydrated = hydrate_state(state)
+    if not is_stale_active_state(hydrated):
+        return hydrated
+    return requeue_pending_work(hydrated)
+
+
 def variant_needs_work(variant: dict[str, Any]) -> bool:
     if variant.get("status") in ACTIVE_STATUSES | QUEUED_STATUSES:
         return True
@@ -655,20 +722,35 @@ def download_audio(source_url: str, state: dict[str, Any]) -> tuple[str, bool]:
 
     extension = str(track.get("extension") or "bin").strip(".")
     target_path = Path(temp_dir) / f"{sanitize_filename_component(state['title'])} [{state['video_id']}].{extension}"
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_SECONDS
     try:
-        with requests.get(track["url"], stream=True, timeout=60) as response:
+        with requests.get(
+            track["url"],
+            stream=True,
+            timeout=(DOWNLOAD_CONNECT_TIMEOUT_SECONDS, DOWNLOAD_READ_TIMEOUT_SECONDS),
+        ) as response:
             response.raise_for_status()
             total_bytes = 0
             with open(target_path, "wb") as handle:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"Audio download timed out after {int(DOWNLOAD_DEADLINE_SECONDS)} seconds."
+                        )
                     total_bytes += len(chunk)
                     if total_bytes > MAX_AUDIO_BYTES:
                         raise AudioTooLargeError(
                             f"Downloaded audio exceeds the v1 size cap of {MAX_AUDIO_BYTES // (1024 * 1024)} MB."
                         )
                     handle.write(chunk)
+    except requests.exceptions.Timeout as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError("Audio download timed out while waiting for the upstream media stream.") from exc
+    except requests.exceptions.RequestException as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(f"Audio download failed: {exc}") from exc
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -835,7 +917,7 @@ def probe_job_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def process_job(state: dict[str, Any]) -> dict[str, Any]:
-    hydrated = hydrate_state(state)
+    hydrated = recover_stale_active_state(state)
     if hydrated["status"] in ACTIVE_STATUSES | UNSUPPORTED_STATUSES:
         return hydrated
     if not any(variant_needs_work(variant) for variant in ensure_variant_map(hydrated).values()):
@@ -1030,7 +1112,7 @@ def create_or_reuse_job(source_url: str) -> dict[str, Any]:
     job_id = make_job_id(cache_key)
     existing_state = storage.load_state(job_id)
     if existing_state:
-        hydrated = hydrate_state(existing_state)
+        hydrated = recover_stale_active_state(existing_state)
         if hydrated["status"] in ACTIVE_STATUSES | QUEUED_STATUSES | UNSUPPORTED_STATUSES:
             return hydrated
         if (
@@ -1820,8 +1902,8 @@ def create_job(payload: JobCreateRequest) -> JSONResponse:
         state = create_error_state(
             payload.source_url,
             (
-                "The deployment could not access YouTube metadata. "
-                "YouTube is blocking automated requests from the current runtime."
+                "The deployment could not access video metadata from the configured provider. "
+                "Please try again later."
             ),
         )
     return JSONResponse(hydrate_state(state))
@@ -1832,7 +1914,7 @@ def get_job(job_id: str) -> JSONResponse:
     state = storage.load_state(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return JSONResponse(hydrate_state(state))
+    return JSONResponse(recover_stale_active_state(state))
 
 
 @app.post("/api/jobs/{job_id}/run")
@@ -1840,7 +1922,7 @@ def run_job(job_id: str, payload: JobRunRequest) -> JSONResponse:
     state = storage.load_state(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found.")
-    hydrated = hydrate_state(state)
+    hydrated = recover_stale_active_state(state)
     if hydrated["status"] in TERMINAL_STATUSES or hydrated["status"] in ACTIVE_STATUSES:
         if hydrated["status"] in ACTIVE_STATUSES:
             return JSONResponse(hydrate_state(hydrated))
