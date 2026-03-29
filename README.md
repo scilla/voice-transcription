@@ -216,7 +216,7 @@ Keep polling continuously:
 .venv/bin/python -m cill.worker --loop --interval-seconds 10
 ```
 
-In local development, the worker uses the filesystem cache. In production, if `BLOB_READ_WRITE_TOKEN` is present, it consumes queued jobs from Vercel Blob.
+The app and worker automatically load the project `.env` file before choosing a storage backend. In local development, the worker uses the filesystem cache. If `.env` includes `BLOB_READ_WRITE_TOKEN`, it consumes queued jobs from Vercel Blob instead.
 
 ### Local Cache Reuse
 

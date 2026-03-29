@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -23,6 +24,7 @@ from cill.storage import (
     WEB_DIARIZED_TRANSCRIPT_FILENAME,
     WEB_SUMMARY_FILENAME,
     WEB_TRANSCRIPT_FILENAME,
+    create_storage_backend,
 )
 from cill.worker import process_pending_jobs
 
@@ -141,6 +143,21 @@ class WebAppTests(unittest.TestCase):
         state = storage.load_state("job-1")
 
         self.assertEqual(state, {"status": "cache_hit"})
+
+    def test_create_storage_backend_loads_blob_token_from_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                Path(".env").write_text('BLOB_READ_WRITE_TOKEN="blob-token"\n', encoding="utf-8")
+                with mock.patch.dict("os.environ", {}, clear=True):
+                    with mock.patch("cill.storage.BlobStorageBackend", return_value="blob-backend") as blob_mock:
+                        backend = create_storage_backend()
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertEqual(backend, "blob-backend")
+        blob_mock.assert_called_once_with()
 
     @mock.patch("cill.app.probe_youtube_metadata")
     def test_create_or_reuse_job_uses_cached_local_outputs(self, probe_mock: mock.Mock) -> None:

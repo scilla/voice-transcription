@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
 
+from cill.env import load_project_dotenv
+
 try:  # pragma: no cover - depends on installed extras
     from vercel.blob import get as vercel_get
     from vercel.blob import list_objects as vercel_list_objects
@@ -311,6 +313,7 @@ class BlobStorageBackend(StorageBackend):
 
 
 def create_storage_backend() -> StorageBackend:
+    load_project_dotenv()
     if os.getenv("BLOB_READ_WRITE_TOKEN"):
         return BlobStorageBackend()
     return LocalStorageBackend()
