@@ -41,6 +41,18 @@ YTDLP_WEB_FORMAT = (
     "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio[ext=webm]/"
     "bestaudio[ext=ogg]/bestaudio[acodec!=none]/bestaudio"
 )
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="cill app icon">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111827" />
+      <stop offset="100%" stop-color="#0f766e" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#bg)" />
+  <path d="M22 20a12 12 0 1 0 0 24h6v-8h-6a4 4 0 1 1 0-8h14v-8H22Z" fill="#f8fafc" />
+  <path d="M42 20h-8v24h8a12 12 0 1 0 0-24Zm0 16h-2v-8h2a4 4 0 1 1 0 8Z" fill="#fbbf24" />
+</svg>
+"""
 
 app = FastAPI(title="cill.app transcript viewer")
 storage = create_storage_backend()
@@ -381,6 +393,7 @@ def render_instructions_page(message: Optional[str] = None) -> str:
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>cill.app</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <style>
       body {{ font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 48rem; padding: 0 1rem; line-height: 1.5; }}
       code {{ background: #f3f4f6; padding: 0.15rem 0.35rem; border-radius: 0.35rem; }}
@@ -407,6 +420,7 @@ def render_processing_page(source_url: str) -> str:
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>cill.app</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <style>
       body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem 4rem; line-height: 1.5; }}
       h1, h2 {{ margin-bottom: 0.5rem; }}
@@ -567,7 +581,12 @@ def root(request: Request) -> HTMLResponse:
 
 @app.get("/favicon.ico")
 def favicon() -> Response:
-    return Response(status_code=204)
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
+
+
+@app.get("/favicon.svg")
+def favicon_svg() -> Response:
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)

@@ -268,3 +268,16 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Replace", response.text)
+
+    def test_favicon_routes_return_svg(self) -> None:
+        client = TestClient(app)
+
+        ico_response = client.get("/favicon.ico")
+        svg_response = client.get("/favicon.svg")
+
+        self.assertEqual(ico_response.status_code, 200)
+        self.assertEqual(svg_response.status_code, 200)
+        self.assertEqual(ico_response.headers["content-type"], "image/svg+xml")
+        self.assertEqual(svg_response.headers["content-type"], "image/svg+xml")
+        self.assertIn("<svg", ico_response.text)
+        self.assertIn("<svg", svg_response.text)
