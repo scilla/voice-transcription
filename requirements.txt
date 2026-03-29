@@ -1,3 +1,9 @@
 openai
 python-dotenv
+fastapi
+uvicorn
+yt-dlp
+vercel-blob
+requests
+httpx
 # Note: ffmpeg must be installed separately (brew install ffmpeg on macOS)

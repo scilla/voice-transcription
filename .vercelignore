@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+.git
+.venv
+/app.py
+/index.py
+__pycache__
+tests
+sources
+output
+*.pyc

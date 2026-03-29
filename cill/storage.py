@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import json
+import os
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Optional
+
+import requests
+
+try:  # pragma: no cover - depends on installed extras
+    import vercel_blob
+except ImportError:  # pragma: no cover - depends on installed extras
+    vercel_blob = None
+
+
+LOCAL_WEB_CACHE_DIRNAME = "web-cache"
+WEB_STATE_FILENAME = "meta.json"
+WEB_TRANSCRIPT_FILENAME = "transcript.txt"
+WEB_SUMMARY_FILENAME = "summary.txt"
+
+
+class StorageBackend(ABC):
+    @abstractmethod
+    def load_state(self, job_id: str) -> Optional[dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_state(self, job_id: str, state: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def read_text(self, job_id: str, filename: str, video_id: Optional[str] = None) -> Optional[str]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def write_text(self, job_id: str, filename: str, value: str) -> None:
+        raise NotImplementedError
+
+    def find_cached_audio(self, video_id: str) -> Optional[str]:
+        return None
+
+
+class LocalStorageBackend(StorageBackend):
+    def __init__(self, output_dir: str = "./output", audio_dir: str = "./sources/youtube") -> None:
+        self.output_dir = Path(output_dir)
+        self.audio_dir = Path(audio_dir)
+        self.web_cache_dir = self.output_dir / LOCAL_WEB_CACHE_DIRNAME
+        self.web_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _job_dir(self, job_id: str) -> Path:
+        return self.web_cache_dir / job_id
+
+    def _job_path(self, job_id: str, filename: str) -> Path:
+        return self._job_dir(job_id) / filename
+
+    def load_state(self, job_id: str) -> Optional[dict[str, Any]]:
+        state_path = self._job_path(job_id, WEB_STATE_FILENAME)
+        if not state_path.exists():
+            return None
+        return json.loads(state_path.read_text(encoding="utf-8"))
+
+    def save_state(self, job_id: str, state: dict[str, Any]) -> None:
+        job_dir = self._job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        self._job_path(job_id, WEB_STATE_FILENAME).write_text(
+            json.dumps(state, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def read_text(self, job_id: str, filename: str, video_id: Optional[str] = None) -> Optional[str]:
+        local_path = self._job_path(job_id, filename)
+        if local_path.exists():
+            return local_path.read_text(encoding="utf-8")
+
+        if not video_id:
+            return None
+
+        if filename == WEB_TRANSCRIPT_FILENAME:
+            return self._read_legacy_transcript(video_id)
+        if filename == WEB_SUMMARY_FILENAME:
+            return self._read_legacy_summary(video_id)
+        return None
+
+    def write_text(self, job_id: str, filename: str, value: str) -> None:
+        job_dir = self._job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        self._job_path(job_id, filename).write_text(value, encoding="utf-8")
+
+    def find_cached_audio(self, video_id: str) -> Optional[str]:
+        if not self.audio_dir.exists():
+            return None
+
+        marker = f"[{video_id}]"
+        matches: list[tuple[float, str]] = []
+        for candidate in self.audio_dir.iterdir():
+            if marker not in candidate.name or not candidate.is_file():
+                continue
+            matches.append((candidate.stat().st_mtime, str(candidate)))
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return matches[0][1]
+
+    def _read_legacy_transcript(self, video_id: str) -> Optional[str]:
+        marker = f"[{video_id}]"
+        matches = sorted(
+            [
+                path
+                for path in self.output_dir.iterdir()
+                if path.is_file()
+                and marker in path.name
+                and path.name.endswith("__plain__lang-auto.txt")
+                and not path.name.endswith("__summary.txt")
+            ],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not matches:
+            return None
+
+        content = matches[0].read_text(encoding="utf-8").strip()
+        full_transcript_marker = "\nFull transcript:\n"
+        if full_transcript_marker in content:
+            return content.split(full_transcript_marker, 1)[1].strip()
+
+        parts = content.split("\n\n", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return content
+
+    def _read_legacy_summary(self, video_id: str) -> Optional[str]:
+        marker = f"[{video_id}]"
+        matches = sorted(
+            [
+                path
+                for path in self.output_dir.iterdir()
+                if path.is_file()
+                and marker in path.name
+                and path.name.endswith("__plain__lang-auto__summary.txt")
+            ],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not matches:
+            return None
+
+        content = matches[0].read_text(encoding="utf-8").strip()
+        summary_marker = "\nSummary:\n"
+        if summary_marker in content:
+            return content.split(summary_marker, 1)[1].strip()
+        parts = content.split("\n\n", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return content
+
+
+class BlobStorageBackend(StorageBackend):
+    def __init__(self, prefix: str = "cill-web", token: Optional[str] = None) -> None:
+        if vercel_blob is None:  # pragma: no cover - depends on installed extras
+            raise RuntimeError("vercel-blob is not installed")
+
+        self.prefix = prefix.strip("/ ")
+        self.token = token or os.getenv("BLOB_READ_WRITE_TOKEN")
+        if not self.token:
+            raise RuntimeError("BLOB_READ_WRITE_TOKEN is not set")
+
+    def _job_prefix(self, job_id: str) -> str:
+        return f"{self.prefix}/jobs/{job_id}"
+
+    def _pathname(self, job_id: str, filename: str) -> str:
+        return f"{self._job_prefix(job_id)}/{filename}"
+
+    def _list_job_blobs(self, job_id: str) -> dict[str, dict[str, Any]]:
+        response = vercel_blob.list({"token": self.token, "prefix": self._job_prefix(job_id)})
+        blobs = response.get("blobs", [])
+        return {blob["pathname"]: blob for blob in blobs}
+
+    def _read_blob_text(self, blob_url: str) -> str:
+        response = requests.get(blob_url, timeout=30)
+        response.raise_for_status()
+        return response.text
+
+    def load_state(self, job_id: str) -> Optional[dict[str, Any]]:
+        blobs = self._list_job_blobs(job_id)
+        blob = blobs.get(self._pathname(job_id, WEB_STATE_FILENAME))
+        if not blob:
+            return None
+        return json.loads(self._read_blob_text(blob["url"]))
+
+    def save_state(self, job_id: str, state: dict[str, Any]) -> None:
+        vercel_blob.put(
+            self._pathname(job_id, WEB_STATE_FILENAME),
+            json.dumps(state, indent=2, sort_keys=True).encode("utf-8"),
+            {"token": self.token, "allowOverwrite": True, "addRandomSuffix": False},
+        )
+
+    def read_text(self, job_id: str, filename: str, video_id: Optional[str] = None) -> Optional[str]:
+        blobs = self._list_job_blobs(job_id)
+        blob = blobs.get(self._pathname(job_id, filename))
+        if not blob:
+            return None
+        return self._read_blob_text(blob["url"])
+
+    def write_text(self, job_id: str, filename: str, value: str) -> None:
+        vercel_blob.put(
+            self._pathname(job_id, filename),
+            value.encode("utf-8"),
+            {"token": self.token, "allowOverwrite": True, "addRandomSuffix": False},
+        )
+
+
+def create_storage_backend() -> StorageBackend:
+    if os.getenv("BLOB_READ_WRITE_TOKEN"):
+        return BlobStorageBackend()
+    return LocalStorageBackend()
