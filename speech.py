@@ -195,6 +195,7 @@ def get_summary_model_name() -> str:
 def get_openai_api_key() -> str:
     raw_api_key = os.getenv("OPENAI_API_KEY")
     api_key = raw_api_key.strip() if raw_api_key else ""
+    api_key = api_key.replace("\\n", "").replace("\\r", "").replace("\n", "").replace("\r", "")
     if not api_key:
         print("Error: OPENAI_API_KEY is not set. Add it to .env or your shell environment.")
         sys.exit(1)
