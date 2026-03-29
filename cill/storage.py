@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -18,6 +20,8 @@ LOCAL_WEB_CACHE_DIRNAME = "web-cache"
 WEB_STATE_FILENAME = "meta.json"
 WEB_TRANSCRIPT_FILENAME = "transcript.txt"
 WEB_SUMMARY_FILENAME = "summary.txt"
+VERCEL_BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
+VERCEL_BLOB_API_VERSION = "10"
 
 
 class StorageBackend(ABC):
@@ -35,6 +39,10 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def write_text(self, job_id: str, filename: str, value: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_states(self) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     def find_cached_audio(self, video_id: str) -> Optional[str]:
@@ -86,6 +94,18 @@ class LocalStorageBackend(StorageBackend):
         job_dir = self._job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
         self._job_path(job_id, filename).write_text(value, encoding="utf-8")
+
+    def list_states(self) -> list[dict[str, Any]]:
+        if not self.web_cache_dir.exists():
+            return []
+
+        states: list[dict[str, Any]] = []
+        for state_path in sorted(self.web_cache_dir.glob(f"*/{WEB_STATE_FILENAME}")):
+            try:
+                states.append(json.loads(state_path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                continue
+        return states
 
     def find_cached_audio(self, video_id: str) -> Optional[str]:
         if not self.audio_dir.exists():
@@ -203,6 +223,26 @@ class BlobStorageBackend(StorageBackend):
         response.raise_for_status()
         return response.text
 
+    def _put_private_blob(self, pathname: str, data: bytes, content_type: str) -> None:
+        response = requests.put(
+            f"{VERCEL_BLOB_API_BASE_URL}/",
+            params={"pathname": pathname},
+            headers={
+                "access": "private",
+                "authorization": f"Bearer {self.token}",
+                "x-api-version": VERCEL_BLOB_API_VERSION,
+                "x-content-type": content_type,
+                "x-allow-overwrite": "1",
+            },
+            data=data,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+    def _list_all_job_blobs(self) -> list[dict[str, Any]]:
+        response = vercel_blob.list({"token": self.token, "prefix": f"{self.prefix}/jobs/"})
+        return response.get("blobs", [])
+
     def load_state(self, job_id: str) -> Optional[dict[str, Any]]:
         blobs = self._list_job_blobs(job_id)
         blob = self._resolve_blob(blobs, job_id, WEB_STATE_FILENAME)
@@ -211,10 +251,10 @@ class BlobStorageBackend(StorageBackend):
         return json.loads(self._read_blob_text(blob["url"]))
 
     def save_state(self, job_id: str, state: dict[str, Any]) -> None:
-        vercel_blob.put(
+        self._put_private_blob(
             self._pathname(job_id, WEB_STATE_FILENAME),
             json.dumps(state, indent=2, sort_keys=True).encode("utf-8"),
-            {"token": self.token, "allowOverwrite": True, "addRandomSuffix": False},
+            "application/json",
         )
 
     def read_text(self, job_id: str, filename: str, video_id: Optional[str] = None) -> Optional[str]:
@@ -225,11 +265,43 @@ class BlobStorageBackend(StorageBackend):
         return self._read_blob_text(blob["url"])
 
     def write_text(self, job_id: str, filename: str, value: str) -> None:
-        vercel_blob.put(
+        self._put_private_blob(
             self._pathname(job_id, filename),
             value.encode("utf-8"),
-            {"token": self.token, "allowOverwrite": True, "addRandomSuffix": False},
+            mimetypes.guess_type(filename)[0] or "text/plain",
         )
+
+    def list_states(self) -> list[dict[str, Any]]:
+        candidates: dict[str, dict[str, Any]] = {}
+        prefix = f"{self.prefix}/jobs/"
+        for blob in self._list_all_job_blobs():
+            pathname = blob.get("pathname", "")
+            if not pathname.startswith(prefix):
+                continue
+
+            remainder = pathname[len(prefix) :]
+            parts = remainder.split("/", 1)
+            if len(parts) != 2:
+                continue
+
+            job_id, filename = parts
+            if filename != WEB_STATE_FILENAME and not (
+                filename.startswith("meta-") and filename.endswith(".json")
+            ):
+                continue
+
+            current = candidates.get(job_id)
+            if current and current.get("uploadedAt", "") >= blob.get("uploadedAt", ""):
+                continue
+            candidates[job_id] = blob
+
+        states: list[dict[str, Any]] = []
+        for blob in candidates.values():
+            try:
+                states.append(json.loads(self._read_blob_text(blob["url"])))
+            except (KeyError, json.JSONDecodeError, requests.RequestException):
+                continue
+        return states
 
 
 def create_storage_backend() -> StorageBackend:

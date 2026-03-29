@@ -2,7 +2,7 @@
 
 A small Python utility to transcribe local audio/video files or YouTube videos/lives using OpenAI's transcription models. It can scan the `sources/` folder, download YouTube media into `sources/youtube/`, extract audio when needed, split long recordings into chunks, and save the transcript to `output/<source-name>.txt`.
 
-The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `youtube.cill.app/...` or `www.youtube.cill.app/...` back to the original `youtube.com` URL, reuses cached transcript/summary artifacts when possible, and renders the transcript first with the summary below it.
+The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `youtube.cill.app/...` or `www.youtube.cill.app/...` back to the original `youtube.com` URL, reuses cached transcript/summary artifacts when possible, queues cache misses for a local worker to process, and renders the transcript first with the summary below it.
 
 ## Features
 
@@ -18,6 +18,7 @@ The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `
 - Optional second-step summary with `--summarize`
 - Saves the full transcript and, when diarization is enabled, speaker-labeled segments
 - FastAPI web app for `youtube.cill.app` with transcript-first rendering and polling job states
+- Queue-based web processing for cache misses, consumed by a local worker
 - Local filesystem cache for web development plus Vercel Blob support in production
 
 ## Requirements
@@ -165,14 +166,38 @@ Any `*.localhost` hostname resolves locally in modern browsers, so you can test 
 - `www.youtube.cill.app/watch?v=...` becomes `https://www.youtube.com/watch?v=...`
 - the page creates or reuses a deterministic job
 - if cached transcript and summary already exist, the job returns immediately
-- if only the transcript exists, the app skips download/transcription and generates only the summary
-- otherwise it downloads directly supported audio with Python `yt_dlp`, transcribes it, then summarizes it
+- if only the transcript exists, the job is queued so the worker can generate only the summary
+- otherwise the app queues the job immediately and a local worker downloads audio with Python `yt_dlp`, transcribes it, then summarizes it
 
 The page polls three internal endpoints:
 
 - `POST /api/jobs`
 - `POST /api/jobs/{job_id}/run`
 - `GET /api/jobs/{job_id}`
+
+The browser polls with increasing wait intervals from 5 seconds up to 60 seconds.
+
+### Local Worker
+
+Queue processing happens outside the Vercel request path. Run the worker locally against the same backend that the app uses:
+
+```bash
+.venv/bin/python -m cill.worker
+```
+
+Process a single job:
+
+```bash
+.venv/bin/python -m cill.worker --job-id <job_id>
+```
+
+Keep polling continuously:
+
+```bash
+.venv/bin/python -m cill.worker --loop --interval-seconds 10
+```
+
+In local development, the worker uses the filesystem cache. In production, if `BLOB_READ_WRITE_TOKEN` is present, it consumes queued jobs from Vercel Blob.
 
 ### Local Cache Reuse
 

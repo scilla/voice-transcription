@@ -19,6 +19,7 @@ from cill.storage import (
     WEB_SUMMARY_FILENAME,
     WEB_TRANSCRIPT_FILENAME,
 )
+from cill.worker import process_pending_jobs
 
 
 class WebAppTests(unittest.TestCase):
@@ -67,6 +68,7 @@ class WebAppTests(unittest.TestCase):
         vercel_blob_mock: mock.Mock,
         requests_get_mock: mock.Mock,
     ) -> None:
+        requests_put_mock = mock.Mock()
         requests_get_mock.return_value = mock.Mock(
             text='{"status":"idle"}',
             raise_for_status=mock.Mock(),
@@ -80,15 +82,26 @@ class WebAppTests(unittest.TestCase):
             ]
         }
 
-        storage = BlobStorageBackend(prefix="prefix", token="test-token")
-        state = storage.load_state("job-1")
+        with mock.patch("cill.storage.requests.put", requests_put_mock):
+            requests_put_mock.return_value = mock.Mock(raise_for_status=mock.Mock())
+            storage = BlobStorageBackend(prefix="prefix", token="test-token")
+            state = storage.load_state("job-1")
 
-        self.assertEqual(state, {"status": "idle"})
-        storage.write_text("job-1", WEB_TRANSCRIPT_FILENAME, "Transcript")
-        vercel_blob_mock.put.assert_called_with(
-            "prefix/jobs/job-1/transcript.txt",
-            b"Transcript",
-            {"token": "test-token", "allowOverwrite": True, "addRandomSuffix": False},
+            self.assertEqual(state, {"status": "idle"})
+            storage.write_text("job-1", WEB_TRANSCRIPT_FILENAME, "Transcript")
+
+        requests_put_mock.assert_called_with(
+            "https://blob.vercel-storage.com/",
+            params={"pathname": "prefix/jobs/job-1/transcript.txt"},
+            headers={
+                "access": "private",
+                "authorization": "Bearer test-token",
+                "x-api-version": "10",
+                "x-content-type": "text/plain",
+                "x-allow-overwrite": "1",
+            },
+            data=b"Transcript",
+            timeout=30,
         )
 
     @mock.patch("cill.storage.requests.get")
@@ -151,7 +164,22 @@ class WebAppTests(unittest.TestCase):
         probe_mock.assert_not_called()
 
     @mock.patch("cill.app.probe_youtube_metadata", side_effect=RuntimeError("blocked"))
-    def test_create_or_reuse_job_returns_error_state_when_metadata_probe_fails(self, probe_mock: mock.Mock) -> None:
+    def test_process_job_returns_error_state_when_metadata_probe_fails(self, probe_mock: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            with mock.patch("cill.app.storage", storage):
+                state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
+                result = process_job(state)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("blocked", result["error"])
+        probe_mock.assert_called_once()
+
+    @mock.patch("cill.app.probe_youtube_metadata")
+    def test_create_or_reuse_job_enqueues_cache_miss_without_probe(self, probe_mock: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = LocalStorageBackend(
                 output_dir=str(Path(temp_dir) / "output"),
@@ -160,12 +188,12 @@ class WebAppTests(unittest.TestCase):
             with mock.patch("cill.app.storage", storage):
                 state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
 
-        self.assertEqual(state["status"], "error")
-        self.assertIn("YouTube is blocking automated requests", state["error"])
-        probe_mock.assert_called_once()
+        self.assertEqual(state["status"], "queued")
+        self.assertEqual(state["video_id"], "abc123")
+        probe_mock.assert_not_called()
 
     @mock.patch("cill.app.probe_youtube_metadata")
-    def test_create_or_reuse_job_rejects_live(self, probe_mock: mock.Mock) -> None:
+    def test_process_job_rejects_live(self, probe_mock: mock.Mock) -> None:
         probe_mock.return_value = {
             "id": "live123",
             "title": "Live",
@@ -181,11 +209,12 @@ class WebAppTests(unittest.TestCase):
             )
             with mock.patch("cill.app.storage", storage):
                 state = create_or_reuse_job("https://youtube.com/watch?v=live123")
+                state = process_job(state)
 
         self.assertEqual(state["status"], "unsupported_live")
 
     @mock.patch("cill.app.probe_youtube_metadata")
-    def test_create_or_reuse_job_rejects_over_duration(self, probe_mock: mock.Mock) -> None:
+    def test_process_job_rejects_over_duration(self, probe_mock: mock.Mock) -> None:
         probe_mock.return_value = {
             "id": "long123",
             "title": "Long Video",
@@ -201,6 +230,7 @@ class WebAppTests(unittest.TestCase):
             )
             with mock.patch("cill.app.storage", storage):
                 state = create_or_reuse_job("https://youtube.com/watch?v=long123")
+                state = process_job(state)
 
         self.assertEqual(state["status"], "unsupported_duration")
 
@@ -274,8 +304,20 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Creating job", response.text)
         self.assertIn("https://youtube.com/watch?v=abc123", response.text)
 
-    @mock.patch("cill.app.create_or_reuse_job", side_effect=RuntimeError("blocked"))
-    def test_create_job_endpoint_returns_error_state_instead_of_500(self, _: mock.Mock) -> None:
+    @mock.patch("cill.app.create_or_reuse_job")
+    def test_create_job_endpoint_returns_queued_state(self, create_job_mock: mock.Mock) -> None:
+        create_job_mock.return_value = {
+            "job_id": "job123",
+            "status": "queued",
+            "video_id": "abc123",
+            "title": "Unknown",
+            "uploader": "Unknown",
+            "error": None,
+            "transcript_ready": False,
+            "summary_ready": False,
+            "created_at": "now",
+            "updated_at": "now",
+        }
         client = TestClient(app)
         response = client.post(
             "/api/jobs",
@@ -284,9 +326,9 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["status"], "queued")
         self.assertEqual(payload["video_id"], "abc123")
-        self.assertIn("YouTube is blocking automated requests", payload["error"])
+        self.assertIsNone(payload["error"])
 
     def test_instruction_page_for_root(self) -> None:
         client = TestClient(app)
@@ -294,6 +336,7 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Replace", response.text)
+        self.assertIn("/favicon.svg", response.text)
 
     def test_favicon_routes_return_svg(self) -> None:
         client = TestClient(app)
@@ -307,3 +350,29 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(svg_response.headers["content-type"], "image/svg+xml")
         self.assertIn("<svg", ico_response.text)
         self.assertIn("<svg", svg_response.text)
+
+    def test_processing_page_uses_backoff_polling(self) -> None:
+        client = TestClient(app)
+        response = client.get("/watch?v=abc123", headers={"host": "youtube.localhost"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("let delayMs = 5000;", response.text)
+        self.assertIn("Math.min(60000, delayMs + 5000)", response.text)
+        self.assertNotIn("/api/jobs/${state.job_id}/run", response.text)
+
+    @mock.patch("cill.worker.process_job")
+    def test_worker_processes_only_queued_jobs(self, process_job_mock: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            storage.save_state("queued-job", {"job_id": "queued-job", "status": "queued", "source_url": "https://youtube.com/watch?v=abc123"})
+            storage.save_state("done-job", {"job_id": "done-job", "status": "complete", "source_url": "https://youtube.com/watch?v=def456"})
+            process_job_mock.return_value = {"status": "complete"}
+
+            with mock.patch("cill.worker.storage", storage):
+                processed = process_pending_jobs()
+
+        self.assertEqual(processed, 1)
+        process_job_mock.assert_called_once()

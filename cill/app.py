@@ -34,6 +34,7 @@ SUPPORTED_SOURCE_HOSTS = {"youtube.com", "www.youtube.com"}
 UNSUPPORTED_STATUSES = {"unsupported_live", "unsupported_duration", "unsupported_size", "error"}
 TERMINAL_STATUSES = {"complete", "cache_hit", *UNSUPPORTED_STATUSES}
 ACTIVE_STATUSES = {"downloading", "transcribing", "summarizing"}
+QUEUED_STATUSES = {"queued"}
 MAX_VIDEO_SECONDS = int(os.getenv("CILL_MAX_VIDEO_SECONDS", str(25 * 60)))
 MAX_AUDIO_BYTES = int(os.getenv("CILL_MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
 SUPPORTED_WEB_AUDIO_EXTENSIONS = {".m4a", ".mp3", ".webm", ".wav", ".ogg", ".aac", ".mpeg", ".mpga"}
@@ -178,6 +179,25 @@ def probe_youtube_metadata(source_url: str) -> dict[str, Any]:
         return ydl.extract_info(source_url, download=False)
 
 
+def queue_job_state(source_url: str, video_id: str, *, transcript_ready: bool = False, summary_ready: bool = False) -> dict[str, Any]:
+    cache_key = make_cache_key(video_id)
+    timestamp = utc_now_iso()
+    return {
+        "job_id": make_job_id(cache_key),
+        "cache_key": cache_key,
+        "source_url": source_url,
+        "video_id": video_id,
+        "title": "Unknown",
+        "uploader": "Unknown",
+        "status": "queued",
+        "error": None,
+        "transcript_ready": transcript_ready,
+        "summary_ready": summary_ready,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
 def find_downloaded_file(download_dir: str, video_id: str) -> Optional[str]:
     marker = f"[{video_id}]"
     matches: list[tuple[float, str]] = []
@@ -243,7 +263,7 @@ def hydrate_state(state: dict[str, Any]) -> dict[str, Any]:
     hydrated["transcript_ready"] = bool(transcript_text)
     hydrated["summary_ready"] = bool(summary_text)
 
-    if hydrated["status"] == "idle" and hydrated["transcript_ready"] and hydrated["summary_ready"]:
+    if hydrated["status"] in {"idle", "queued"} and hydrated["transcript_ready"] and hydrated["summary_ready"]:
         hydrated["status"] = "cache_hit"
     return hydrated
 
@@ -251,6 +271,37 @@ def hydrate_state(state: dict[str, Any]) -> dict[str, Any]:
 def persist_state(state: dict[str, Any]) -> dict[str, Any]:
     storage.save_state(state["job_id"], state)
     return state
+
+
+def prepare_job_for_processing(state: dict[str, Any]) -> dict[str, Any]:
+    metadata = probe_youtube_metadata(state["source_url"])
+    state["title"] = metadata.get("title") or state.get("title") or "Unknown"
+    state["uploader"] = metadata.get("channel") or metadata.get("uploader") or state.get("uploader") or "Unknown"
+    persist_state(update_state(state, status="queued", error=None))
+
+    live_status = classify_youtube_live_status(metadata)
+    if live_status != "not_live":
+        persist_state(
+            update_state(
+                state,
+                status="unsupported_live",
+                error="Live and archived live videos are not supported in the web app v1.",
+            )
+        )
+        return hydrate_state(state)
+
+    duration_seconds = parse_duration_seconds(metadata)
+    if duration_seconds is None or duration_seconds > MAX_VIDEO_SECONDS:
+        persist_state(
+            update_state(
+                state,
+                status="unsupported_duration",
+                error="Video duration must be 25 minutes or less for the web app v1.",
+            )
+        )
+        return hydrate_state(state)
+
+    return hydrate_state(state)
 
 
 def process_job(state: dict[str, Any]) -> dict[str, Any]:
@@ -271,6 +322,10 @@ def process_job(state: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if not transcript_text:
+            hydrated = prepare_job_for_processing(hydrated)
+            if hydrated["status"] in TERMINAL_STATUSES:
+                return hydrated
+
             persist_state(update_state(hydrated, status="downloading"))
             audio_path, cleanup_temp_dir = download_audio(hydrated["source_url"], hydrated)
             extension = Path(audio_path).suffix.lower()
@@ -328,59 +383,25 @@ def create_or_reuse_job(source_url: str) -> dict[str, Any]:
     job_id = make_job_id(cache_key)
     existing_state = storage.load_state(job_id)
     if existing_state:
-        return hydrate_state(existing_state)
+        hydrated = hydrate_state(existing_state)
+        if hydrated["status"] == "error" and not hydrated["transcript_ready"] and not hydrated["summary_ready"]:
+            return hydrate_state(persist_state(update_state(existing_state, status="queued", error=None)))
+        return hydrated
 
     cached_transcript = storage.read_text(job_id, WEB_TRANSCRIPT_FILENAME, video_id=video_id)
     cached_summary = storage.read_text(job_id, WEB_SUMMARY_FILENAME, video_id=video_id)
     if cached_transcript or cached_summary:
-        cached_state = {
-            "job_id": job_id,
-            "cache_key": cache_key,
-            "source_url": source_url,
-            "video_id": video_id,
-            "title": "Unknown",
-            "uploader": "Unknown",
-            "status": "cache_hit" if cached_transcript and cached_summary else "idle",
-            "error": None,
-            "transcript_ready": bool(cached_transcript),
-            "summary_ready": bool(cached_summary),
-            "created_at": utc_now_iso(),
-            "updated_at": utc_now_iso(),
-        }
+        cached_state = queue_job_state(
+            source_url,
+            video_id,
+            transcript_ready=bool(cached_transcript),
+            summary_ready=bool(cached_summary),
+        )
+        if cached_transcript and cached_summary:
+            cached_state["status"] = "cache_hit"
         return hydrate_state(persist_state(cached_state))
 
-    try:
-        metadata = probe_youtube_metadata(source_url)
-    except Exception:
-        fallback_state = create_error_state(
-            source_url,
-            (
-                "The deployment could not access YouTube metadata. "
-                "YouTube is blocking automated requests from the current runtime."
-            ),
-        )
-        return hydrate_state(persist_state(fallback_state))
-
-    live_status = classify_youtube_live_status(metadata)
-    base_state = create_job_state(source_url, metadata, status="idle")
-
-    if live_status != "not_live":
-        base_state["status"] = "unsupported_live"
-        base_state["error"] = "Live and archived live videos are not supported in the web app v1."
-        return hydrate_state(persist_state(base_state))
-
-    duration_seconds = parse_duration_seconds(metadata)
-    if duration_seconds is None or duration_seconds > MAX_VIDEO_SECONDS:
-        base_state["status"] = "unsupported_duration"
-        base_state["error"] = (
-            f"Video duration must be 25 minutes or less for the web app v1."
-        )
-        return hydrate_state(persist_state(base_state))
-
-    hydrated = hydrate_state(base_state)
-    if hydrated["transcript_ready"] and hydrated["summary_ready"]:
-        hydrated["status"] = "cache_hit"
-    return hydrate_state(persist_state(hydrated))
+    return hydrate_state(persist_state(queue_job_state(source_url, video_id)))
 
 
 def render_instructions_page(message: Optional[str] = None) -> str:
@@ -481,13 +502,15 @@ def render_processing_page(source_url: str) -> str:
       }}
 
       async function poll(jobId) {{
+        let delayMs = 5000;
         while (true) {{
           const state = await fetchState(jobId);
           renderState(state);
           if (terminalStates.has(state.status) && (state.summary || state.error || state.status === 'cache_hit')) {{
             return;
           }}
-          await new Promise((resolve) => setTimeout(resolve, 1500));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          delayMs = Math.min(60000, delayMs + 5000);
         }}
       }}
 
@@ -511,11 +534,6 @@ def render_processing_page(source_url: str) -> str:
         if (terminalStates.has(state.status)) {{
           return;
         }}
-
-        fetch(`/api/jobs/${{state.job_id}}/run`, {{ method: 'POST' }}).catch((error) => {{
-          statusEl.textContent = `error — ${{error.message}}`;
-          statusEl.className = 'status error';
-        }});
 
         await poll(state.job_id);
       }}
@@ -560,7 +578,10 @@ def run_job(job_id: str) -> JSONResponse:
     state = storage.load_state(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return JSONResponse(process_job(state))
+    hydrated = hydrate_state(state)
+    if hydrated["status"] in TERMINAL_STATUSES or hydrated["status"] in ACTIVE_STATUSES:
+        return JSONResponse(hydrate_state(hydrated))
+    return JSONResponse(hydrate_state(persist_state(update_state(hydrated, status="queued", error=None))))
 
 
 @app.get("/", response_class=HTMLResponse)
