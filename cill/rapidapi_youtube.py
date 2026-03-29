@@ -17,6 +17,13 @@ KEY_ENV_NAMES = ("X_RAPIDAPI_KEY", "CILL_RAPIDAPI_KEY", "RAPIDAPI_KEY")
 TIMECODE_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?[,.]\d{3}\s+-->\s+\d{1,2}:\d{2}(?::\d{2})?[,.]\d{3}")
 TAG_RE = re.compile(r"<[^>]+>")
 WORD_RE = re.compile(r"\b[\w']+\b", flags=re.UNICODE)
+MIN_VALID_SUBTITLE_WORD_COUNT = int(os.getenv("CILL_MIN_VALID_SUBTITLE_WORD_COUNT", "120"))
+MIN_VALID_SUBTITLE_LINE_COUNT = int(os.getenv("CILL_MIN_VALID_SUBTITLE_LINE_COUNT", "20"))
+MIN_VALID_SUBTITLE_CHAR_COUNT = int(os.getenv("CILL_MIN_VALID_SUBTITLE_CHAR_COUNT", "400"))
+MIN_VALID_SUBTITLE_WORDS_PER_MINUTE = float(os.getenv("CILL_MIN_VALID_SUBTITLE_WPM", "60"))
+MAX_VALID_SUBTITLE_WORDS_PER_MINUTE = float(os.getenv("CILL_MAX_VALID_SUBTITLE_WPM", "260"))
+MIN_VALID_SUBTITLE_COVERAGE_RATIO = float(os.getenv("CILL_MIN_VALID_SUBTITLE_COVERAGE", "0.45"))
+MAX_VALID_SUBTITLE_COVERAGE_RATIO = float(os.getenv("CILL_MAX_VALID_SUBTITLE_COVERAGE", "2.5"))
 
 
 class RapidAPIYoutubeError(RuntimeError):
@@ -220,16 +227,45 @@ def _normalize_timed_text_subtitles(raw_text: str) -> str:
 def build_subtitle_stats(text: str, duration_seconds: Optional[float]) -> dict[str, Any]:
     words = WORD_RE.findall(text)
     non_empty_lines = [line for line in text.splitlines() if line.strip()]
+    duration_minutes = round(duration_seconds / 60, 2) if duration_seconds and duration_seconds > 0 else None
+    estimated_minutes = round(len(words) / 150, 2) if words else None
+    coverage_ratio = None
+    if duration_minutes and estimated_minutes is not None:
+        coverage_ratio = round(estimated_minutes / duration_minutes, 2)
     stats: dict[str, Any] = {
         "char_count": len(text),
         "word_count": len(words),
         "line_count": len(non_empty_lines),
         "duration_seconds": duration_seconds,
+        "duration_minutes": duration_minutes,
         "words_per_minute": None,
-        "estimated_minutes_from_words": None,
+        "estimated_minutes_from_words": estimated_minutes,
+        "coverage_ratio": coverage_ratio,
     }
     if duration_seconds and duration_seconds > 0:
         stats["words_per_minute"] = round(len(words) / (duration_seconds / 60), 1)
-    if words:
-        stats["estimated_minutes_from_words"] = round(len(words) / 150, 2)
     return stats
+
+
+def validate_subtitle_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    word_count = int(stats.get("word_count") or 0)
+    line_count = int(stats.get("line_count") or 0)
+    char_count = int(stats.get("char_count") or 0)
+    words_per_minute = stats.get("words_per_minute")
+    coverage_ratio = stats.get("coverage_ratio")
+
+    if char_count < MIN_VALID_SUBTITLE_CHAR_COUNT:
+        return {"usable": False, "reason": "subtitle_text_too_short"}
+    if line_count < MIN_VALID_SUBTITLE_LINE_COUNT:
+        return {"usable": False, "reason": "subtitle_line_count_too_low"}
+    if word_count < MIN_VALID_SUBTITLE_WORD_COUNT:
+        return {"usable": False, "reason": "subtitle_word_count_too_low"}
+    if words_per_minute is not None and not (
+        MIN_VALID_SUBTITLE_WORDS_PER_MINUTE <= float(words_per_minute) <= MAX_VALID_SUBTITLE_WORDS_PER_MINUTE
+    ):
+        return {"usable": False, "reason": "subtitle_words_per_minute_out_of_range"}
+    if coverage_ratio is not None and not (
+        MIN_VALID_SUBTITLE_COVERAGE_RATIO <= float(coverage_ratio) <= MAX_VALID_SUBTITLE_COVERAGE_RATIO
+    ):
+        return {"usable": False, "reason": "subtitle_coverage_ratio_out_of_range"}
+    return {"usable": True, "reason": "ok"}

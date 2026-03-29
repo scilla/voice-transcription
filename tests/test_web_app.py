@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -10,10 +11,13 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from cill.app import (
+    JobRunRequest,
     MAX_VIDEO_SECONDS,
+    VariantRunRequest,
     app,
     create_or_reuse_job,
     process_job,
+    queue_requested_work,
     reconstruct_source_url,
 )
 from cill.shared import extract_youtube_video_id
@@ -22,6 +26,8 @@ from cill.storage import (
     LocalStorageBackend,
     WEB_DIARIZED_SUMMARY_FILENAME,
     WEB_DIARIZED_TRANSCRIPT_FILENAME,
+    WEB_RAPIDAPI_SUBTITLE_METADATA_FILENAME,
+    WEB_RAPIDAPI_SUBTITLE_TEXT_FILENAME,
     WEB_SUMMARY_FILENAME,
     WEB_TRANSCRIPT_FILENAME,
     create_storage_backend,
@@ -30,6 +36,8 @@ from cill.worker import process_pending_jobs
 
 
 class WebAppTests(unittest.TestCase):
+    VIDEO_ID = "abc123xyz89"
+
     def test_reconstruct_source_url_for_supported_hosts(self) -> None:
         self.assertEqual(
             reconstruct_source_url("youtube.cill.app", "/watch", "v=abc123"),
@@ -162,7 +170,7 @@ class WebAppTests(unittest.TestCase):
     @mock.patch("cill.app.probe_youtube_metadata")
     def test_create_or_reuse_job_uses_cached_local_outputs(self, probe_mock: mock.Mock) -> None:
         probe_mock.return_value = {
-            "id": "abc123",
+            "id": self.VIDEO_ID,
             "title": "Video",
             "uploader": "Uploader",
             "duration": 120,
@@ -174,33 +182,33 @@ class WebAppTests(unittest.TestCase):
             audio_dir = Path(temp_dir) / "audio"
             output_dir.mkdir(parents=True, exist_ok=True)
             audio_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "Video [abc123]__plain__lang-auto.txt").write_text(
+            (output_dir / f"Video [{self.VIDEO_ID}]__plain__lang-auto.txt").write_text(
                 "header\n\nCached transcript",
                 encoding="utf-8",
             )
-            (output_dir / "Video [abc123]__plain__lang-auto__summary.txt").write_text(
+            (output_dir / f"Video [{self.VIDEO_ID}]__plain__lang-auto__summary.txt").write_text(
                 "header\nSummary:\nCached summary",
                 encoding="utf-8",
             )
-            (output_dir / "Video [abc123]__diarized__lang-auto.txt").write_text(
+            (output_dir / f"Video [{self.VIDEO_ID}]__diarized__lang-auto.txt").write_text(
                 "header\n\nCached diarized transcript",
                 encoding="utf-8",
             )
-            (output_dir / "Video [abc123]__diarized__lang-auto__summary.txt").write_text(
+            (output_dir / f"Video [{self.VIDEO_ID}]__diarized__lang-auto__summary.txt").write_text(
                 "header\nSummary:\nCached diarized summary",
                 encoding="utf-8",
             )
 
             storage = LocalStorageBackend(output_dir=str(output_dir), audio_dir=str(audio_dir))
             with mock.patch("cill.app.storage", storage):
-                state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
 
         self.assertEqual(state["status"], "cache_hit")
         self.assertEqual(state["transcript"], "Cached transcript")
         self.assertEqual(state["summary"], "Cached summary")
         self.assertEqual(state["variants"]["diarized"]["transcript"], "Cached diarized transcript")
         self.assertEqual(state["variants"]["diarized"]["summary"], "Cached diarized summary")
-        probe_mock.assert_not_called()
+        probe_mock.assert_called_once()
 
     @mock.patch("cill.app.probe_youtube_metadata", side_effect=RuntimeError("blocked"))
     def test_process_job_returns_error_state_when_metadata_probe_fails(self, probe_mock: mock.Mock) -> None:
@@ -210,49 +218,68 @@ class WebAppTests(unittest.TestCase):
                 audio_dir=str(Path(temp_dir) / "audio"),
             )
             with mock.patch("cill.app.storage", storage):
-                state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
+                state = queue_requested_work(
+                    state,
+                    JobRunRequest(plain=VariantRunRequest(transcript=True)),
+                )
                 result = process_job(state)
 
         self.assertEqual(result["status"], "error")
         self.assertIn("blocked", result["error"])
-        probe_mock.assert_called_once()
+        self.assertGreaterEqual(probe_mock.call_count, 1)
 
     @mock.patch("cill.app.probe_youtube_metadata")
-    def test_create_or_reuse_job_enqueues_cache_miss_without_probe(self, probe_mock: mock.Mock) -> None:
+    def test_create_or_reuse_job_probes_cache_miss_without_queueing(self, probe_mock: mock.Mock) -> None:
+        probe_mock.return_value = {
+            "id": self.VIDEO_ID,
+            "title": "Video",
+            "uploader": "Uploader",
+            "duration": 120,
+            "live_status": "not_live",
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = LocalStorageBackend(
                 output_dir=str(Path(temp_dir) / "output"),
                 audio_dir=str(Path(temp_dir) / "audio"),
             )
             with mock.patch("cill.app.storage", storage):
-                state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
 
-        self.assertEqual(state["status"], "queued")
-        self.assertEqual(state["video_id"], "abc123")
-        probe_mock.assert_not_called()
+        self.assertEqual(state["status"], "idle")
+        self.assertEqual(state["video_id"], self.VIDEO_ID)
+        probe_mock.assert_called_once()
 
-    def test_create_or_reuse_job_returns_partial_cache_state_when_only_plain_exists(self) -> None:
+    @mock.patch("cill.app.probe_youtube_metadata")
+    def test_create_or_reuse_job_returns_partial_cache_state_when_only_plain_exists(self, probe_mock: mock.Mock) -> None:
+        probe_mock.return_value = {
+            "id": self.VIDEO_ID,
+            "title": "Video",
+            "uploader": "Uploader",
+            "duration": 120,
+            "live_status": "not_live",
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "output"
             audio_dir = Path(temp_dir) / "audio"
             output_dir.mkdir(parents=True, exist_ok=True)
             audio_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "Video [abc123]__plain__lang-auto.txt").write_text(
+            (output_dir / f"Video [{self.VIDEO_ID}]__plain__lang-auto.txt").write_text(
                 "header\n\nCached transcript",
                 encoding="utf-8",
             )
-            (output_dir / "Video [abc123]__plain__lang-auto__summary.txt").write_text(
+            (output_dir / f"Video [{self.VIDEO_ID}]__plain__lang-auto__summary.txt").write_text(
                 "header\nSummary:\nCached summary",
                 encoding="utf-8",
             )
 
             storage = LocalStorageBackend(output_dir=str(output_dir), audio_dir=str(audio_dir))
             with mock.patch("cill.app.storage", storage):
-                state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
 
-        self.assertEqual(state["status"], "queued")
+        self.assertEqual(state["status"], "idle")
         self.assertEqual(state["variants"]["plain"]["status"], "cache_hit")
-        self.assertEqual(state["variants"]["diarized"]["status"], "queued")
+        self.assertEqual(state["variants"]["diarized"]["status"], "idle")
 
     @mock.patch("cill.app.probe_youtube_metadata")
     def test_process_job_rejects_live(self, probe_mock: mock.Mock) -> None:
@@ -271,12 +298,12 @@ class WebAppTests(unittest.TestCase):
             )
             with mock.patch("cill.app.storage", storage):
                 state = create_or_reuse_job("https://youtube.com/watch?v=live123")
-                state = process_job(state)
 
         self.assertEqual(state["status"], "unsupported_live")
 
+    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles", side_effect=lambda state, duration_seconds: state)
     @mock.patch("cill.app.probe_youtube_metadata")
-    def test_process_job_rejects_over_duration(self, probe_mock: mock.Mock) -> None:
+    def test_process_job_rejects_over_duration(self, probe_mock: mock.Mock, subtitle_mock: mock.Mock) -> None:
         probe_mock.return_value = {
             "id": "long123",
             "title": "Long Video",
@@ -292,9 +319,94 @@ class WebAppTests(unittest.TestCase):
             )
             with mock.patch("cill.app.storage", storage):
                 state = create_or_reuse_job("https://youtube.com/watch?v=long123")
-                state = process_job(state)
 
         self.assertEqual(state["status"], "unsupported_duration")
+
+    @mock.patch("cill.app.download_audio")
+    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles")
+    @mock.patch("cill.app.probe_youtube_metadata")
+    @mock.patch("cill.app.speech.summarize_transcript", return_value="Summary from subtitles")
+    @mock.patch("cill.app.speech.transcribe_audio_file")
+    def test_process_job_uses_valid_subtitles_for_long_plain_variant(
+        self,
+        transcribe_mock: mock.Mock,
+        summarize_mock: mock.Mock,
+        probe_mock: mock.Mock,
+        fetch_subtitles_mock: mock.Mock,
+        download_audio_mock: mock.Mock,
+    ) -> None:
+        probe_mock.return_value = {
+            "id": "long123",
+            "title": "Long Video",
+            "uploader": "Uploader",
+            "duration": MAX_VIDEO_SECONDS + 300,
+            "live_status": "not_live",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+
+            def subtitle_side_effect(state: dict, duration_seconds: float | None) -> dict:
+                subtitle_text = "Subtitle transcript line one.\nSubtitle transcript line two."
+                subtitle_metadata = {
+                    "selected_track": {"code": "en", "kind": None},
+                    "stats": {
+                        "char_count": len(subtitle_text),
+                        "word_count": 240,
+                        "line_count": 24,
+                        "duration_seconds": duration_seconds,
+                        "duration_minutes": 30.0,
+                        "words_per_minute": 120.0,
+                        "estimated_minutes_from_words": 28.0,
+                        "coverage_ratio": 0.93,
+                    },
+                    "validation": {"usable": True, "reason": "ok"},
+                }
+                storage.write_text(state["job_id"], WEB_RAPIDAPI_SUBTITLE_TEXT_FILENAME, subtitle_text)
+                storage.write_text(
+                    state["job_id"],
+                    WEB_RAPIDAPI_SUBTITLE_METADATA_FILENAME,
+                    json.dumps(subtitle_metadata),
+                )
+                rapidapi_state = state["rapidapi"]
+                rapidapi_state.update(
+                    {
+                        "configured": True,
+                        "subtitle_available": True,
+                        "subtitle_fetched": True,
+                        "subtitle_language": "en",
+                        "subtitle_kind": None,
+                        "subtitle_word_count": 240,
+                        "subtitle_chars": len(subtitle_text),
+                        "subtitle_duration_seconds": duration_seconds,
+                        "subtitle_usable": True,
+                        "subtitle_validation_reason": "ok",
+                        "error": None,
+                    }
+                )
+                return state
+
+            fetch_subtitles_mock.side_effect = subtitle_side_effect
+
+            with mock.patch("cill.app.storage", storage):
+                state = create_or_reuse_job("https://youtube.com/watch?v=long123")
+                state = queue_requested_work(
+                    state,
+                    JobRunRequest(plain=VariantRunRequest(transcript=True, summary=True)),
+                )
+                final_state = process_job(state)
+
+        self.assertEqual(final_state["status"], "complete")
+        self.assertEqual(final_state["variants"]["plain"]["transcript"], "Subtitle transcript line one.\nSubtitle transcript line two.")
+        self.assertEqual(final_state["variants"]["plain"]["summary"], "Summary from subtitles")
+        self.assertEqual(final_state["variants"]["diarized"]["status"], "idle")
+        self.assertTrue(final_state["rapidapi"]["subtitle_usable"])
+        transcribe_mock.assert_not_called()
+        download_audio_mock.assert_not_called()
+        summarize_mock.assert_called_once()
 
     @mock.patch("cill.app.speech.summarize_transcript", return_value="Fresh summary")
     @mock.patch("cill.app.speech.transcribe_audio_file")
@@ -331,8 +443,12 @@ class WebAppTests(unittest.TestCase):
                         "diarize": False,
                         "status": "queued",
                         "error": None,
+                        "requested_transcript": False,
+                        "requested_summary": True,
                         "transcript_ready": True,
                         "summary_ready": False,
+                        "transcript_source": "legacy_cache",
+                        "summary_basis": None,
                     },
                     "diarized": {
                         "name": "diarized",
@@ -340,8 +456,12 @@ class WebAppTests(unittest.TestCase):
                         "diarize": True,
                         "status": "cache_hit",
                         "error": None,
+                        "requested_transcript": False,
+                        "requested_summary": False,
                         "transcript_ready": True,
                         "summary_ready": True,
+                        "transcript_source": "legacy_cache",
+                        "summary_basis": "legacy_cache",
                     },
                 },
             }
@@ -367,6 +487,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(observed_statuses[-1], "complete")
 
     @mock.patch("cill.app.download_audio")
+    @mock.patch("cill.app.maybe_fetch_rapidapi_subtitles", side_effect=lambda state, duration_seconds: state)
     @mock.patch("cill.app.probe_youtube_metadata")
     @mock.patch("cill.app.speech.summarize_transcript")
     @mock.patch("cill.app.speech.transcribe_audio_file")
@@ -375,10 +496,11 @@ class WebAppTests(unittest.TestCase):
         transcribe_mock: mock.Mock,
         summarize_mock: mock.Mock,
         probe_mock: mock.Mock,
+        subtitle_mock: mock.Mock,
         download_mock: mock.Mock,
     ) -> None:
         probe_mock.return_value = {
-            "id": "abc123",
+            "id": self.VIDEO_ID,
             "title": "Video",
             "uploader": "Uploader",
             "duration": 120,
@@ -402,13 +524,20 @@ class WebAppTests(unittest.TestCase):
             output_dir = Path(temp_dir) / "output"
             audio_dir.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
-            audio_path = audio_dir / "Video [abc123].m4a"
+            audio_path = audio_dir / f"Video [{self.VIDEO_ID}].m4a"
             audio_path.write_bytes(b"test-audio")
             download_mock.return_value = (str(audio_path), False)
             storage = LocalStorageBackend(output_dir=str(output_dir), audio_dir=str(audio_dir))
 
             with mock.patch("cill.app.storage", storage):
-                state = create_or_reuse_job("https://youtube.com/watch?v=abc123")
+                state = create_or_reuse_job(f"https://youtube.com/watch?v={self.VIDEO_ID}")
+                state = queue_requested_work(
+                    state,
+                    JobRunRequest(
+                        plain=VariantRunRequest(transcript=True, summary=True),
+                        diarized=VariantRunRequest(transcript=True, summary=True),
+                    ),
+                )
                 final_state = process_job(state)
 
         self.assertEqual(final_state["status"], "complete")
@@ -439,15 +568,15 @@ class WebAppTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Creating job", response.text)
+        self.assertIn("Queue work", response.text)
         self.assertIn("https://youtube.com/watch?v=abc123", response.text)
 
     @mock.patch("cill.app.create_or_reuse_job")
-    def test_create_job_endpoint_returns_queued_state(self, create_job_mock: mock.Mock) -> None:
+    def test_create_job_endpoint_returns_probe_state(self, create_job_mock: mock.Mock) -> None:
         create_job_mock.return_value = {
             "job_id": "job123",
-            "status": "queued",
-            "video_id": "abc123",
+            "status": "idle",
+            "video_id": self.VIDEO_ID,
             "title": "Unknown",
             "uploader": "Unknown",
             "error": None,
@@ -464,9 +593,59 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["status"], "queued")
-        self.assertEqual(payload["video_id"], "abc123")
+        self.assertEqual(payload["status"], "idle")
+        self.assertEqual(payload["video_id"], self.VIDEO_ID)
         self.assertIsNone(payload["error"])
+
+    def test_run_endpoint_queues_selected_plain_variant_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = LocalStorageBackend(
+                output_dir=str(Path(temp_dir) / "output"),
+                audio_dir=str(Path(temp_dir) / "audio"),
+            )
+            initial_state = {
+                "job_id": "job123",
+                "cache_key": f"youtube:{self.VIDEO_ID}:plain:auto",
+                "source_url": f"https://youtube.com/watch?v={self.VIDEO_ID}",
+                "video_id": self.VIDEO_ID,
+                "title": "Video",
+                "uploader": "Uploader",
+                "duration_seconds": 120,
+                "live_status": "not_live",
+                "status": "idle",
+                "error": None,
+                "transcript_ready": False,
+                "summary_ready": False,
+                "created_at": "now",
+                "updated_at": "now",
+            }
+            storage.save_state("job123", initial_state)
+
+            with mock.patch("cill.app.storage", storage):
+                client = TestClient(app)
+                response = client.post(
+                    "/api/jobs/job123/run",
+                    json={
+                        "plain": {"transcript": True, "summary": True},
+                        "diarized": {"transcript": False, "summary": False},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "queued")
+        self.assertTrue(payload["variants"]["plain"]["requested_transcript"])
+        self.assertTrue(payload["variants"]["plain"]["requested_summary"])
+        self.assertEqual(payload["variants"]["diarized"]["status"], "idle")
+
+    def test_processing_page_renders_manual_queue_controls(self) -> None:
+        client = TestClient(app)
+        response = client.get("/watch?v=abc123xyz89", headers={"host": "youtube.localhost"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Queue work", response.text)
+        self.assertIn("/api/jobs/${currentJobId}/run", response.text)
+        self.assertIn("Nothing queued yet.", response.text)
 
     def test_instruction_page_for_root(self) -> None:
         client = TestClient(app)
@@ -498,7 +677,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("<h2>Diarized</h2>", response.text)
         self.assertIn("let delayMs = 5000;", response.text)
         self.assertIn("Math.min(60000, delayMs + 5000)", response.text)
-        self.assertNotIn("/api/jobs/${state.job_id}/run", response.text)
+        self.assertIn("/api/jobs/${currentJobId}/run", response.text)
 
     @mock.patch("cill.worker.process_job")
     def test_worker_processes_only_queued_jobs(self, process_job_mock: mock.Mock) -> None:
@@ -507,7 +686,42 @@ class WebAppTests(unittest.TestCase):
                 output_dir=str(Path(temp_dir) / "output"),
                 audio_dir=str(Path(temp_dir) / "audio"),
             )
-            storage.save_state("queued-job", {"job_id": "queued-job", "status": "queued", "source_url": "https://youtube.com/watch?v=abc123"})
+            storage.save_state(
+                "queued-job",
+                {
+                    "job_id": "queued-job",
+                    "status": "queued",
+                    "source_url": f"https://youtube.com/watch?v={self.VIDEO_ID}",
+                    "variants": {
+                        "plain": {
+                            "name": "plain",
+                            "label": "Plain transcript",
+                            "diarize": False,
+                            "status": "queued",
+                            "error": None,
+                            "requested_transcript": True,
+                            "requested_summary": False,
+                            "transcript_ready": False,
+                            "summary_ready": False,
+                            "transcript_source": None,
+                            "summary_basis": None,
+                        },
+                        "diarized": {
+                            "name": "diarized",
+                            "label": "Diarized transcript",
+                            "diarize": True,
+                            "status": "idle",
+                            "error": None,
+                            "requested_transcript": False,
+                            "requested_summary": False,
+                            "transcript_ready": False,
+                            "summary_ready": False,
+                            "transcript_source": None,
+                            "summary_basis": None,
+                        },
+                    },
+                },
+            )
             storage.save_state("done-job", {"job_id": "done-job", "status": "complete", "source_url": "https://youtube.com/watch?v=def456"})
             process_job_mock.return_value = {"status": "complete"}
 

@@ -111,3 +111,28 @@ Hello there
         self.assertEqual(stats["char_count"], len("one two three"))
         self.assertEqual(stats["duration_seconds"], 60)
         self.assertEqual(stats["words_per_minute"], 3.0)
+        self.assertEqual(stats["estimated_minutes_from_words"], 0.02)
+        self.assertEqual(stats["coverage_ratio"], 0.02)
+
+    def test_validate_subtitle_stats_accepts_realistic_subtitles(self) -> None:
+        stats = {
+            "char_count": 37620,
+            "word_count": 6643,
+            "line_count": 1042,
+            "duration_seconds": 2856.0,
+            "duration_minutes": 47.6,
+            "words_per_minute": 139.6,
+            "estimated_minutes_from_words": 44.29,
+            "coverage_ratio": 0.93,
+        }
+
+        validation = rapidapi_youtube.validate_subtitle_stats(stats)
+
+        self.assertEqual(validation, {"usable": True, "reason": "ok"})
+
+    def test_validate_subtitle_stats_rejects_sparse_subtitles(self) -> None:
+        stats = rapidapi_youtube.build_subtitle_stats("hello world", 3600)
+
+        validation = rapidapi_youtube.validate_subtitle_stats(stats)
+
+        self.assertFalse(validation["usable"])

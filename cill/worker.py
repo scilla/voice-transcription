@@ -18,7 +18,7 @@ def iter_pending_states(job_id: str | None = None) -> Iterable[dict]:
     states.sort(key=lambda item: (item.get("created_at") or "", item.get("updated_at") or ""))
     for state in states:
         hydrated = hydrate_state(state)
-        if hydrated["status"] != "queued":
+        if hydrated["status"] != "queued" and state.get("status") != "queued":
             continue
         yield hydrated
 

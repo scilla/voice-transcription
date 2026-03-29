@@ -152,14 +152,17 @@ After completion you'll see the output printed to the terminal and find the tran
 The web app is FastAPI-based and is intended for Vercel deployment. v1 is intentionally narrow:
 
 - YouTube VOD only
-- automatic plain and diarized transcription
-- automatic summary after each transcript branch
+- manual queueing from the page UI
+- plain and diarized branches are independent
+- no automatic diarized processing
 - no live streams
 - no local file uploads
 - no ffmpeg/chunking in the web request path
-- hard limit: 25 minutes per video
+- hard limit: 25 minutes for audio-based processing
 - hard limit: 20 MB downloaded audio size
 - optional RapidAPI subtitle lookup when `X_RAPIDAPI_KEY` is configured
+- if subtitles are available and pass validation, the plain transcript branch can run even when the video is longer than 25 minutes
+- the diarized branch still requires audio processing and remains capped at 25 minutes
 
 ### Local Run
 
@@ -181,12 +184,16 @@ Any `*.localhost` hostname resolves locally in modern browsers, so you can test 
 
 - `youtube.cill.app/watch?v=...` becomes `https://youtube.com/watch?v=...`
 - `www.youtube.cill.app/watch?v=...` becomes `https://www.youtube.com/watch?v=...`
-- the page creates or reuses a deterministic job
+- the page creates or reuses a deterministic job and probes metadata only
 - the page renders two columns: `Plain` and `Diarized`
-- if both branches already have transcript and summary, the job returns immediately
-- if one branch is cached and the other is missing, the cached branch appears immediately while the worker fills the missing branch
-- the worker downloads audio once, then computes the plain and diarized transcript+summary branches in parallel
-- if `X_RAPIDAPI_KEY` is configured, the worker also attempts a YouTube subtitle lookup and stores subtitle metadata for later quality checks
+- cached transcript/summary artifacts render immediately
+- missing work stays idle until the user explicitly queues it
+- queue controls let the user request `Transcript only` or `Transcript + summary` independently for each branch
+- the worker downloads audio once, then computes only the explicitly requested missing branches
+- if `X_RAPIDAPI_KEY` is configured, the worker also attempts a YouTube subtitle lookup, validates subtitle coverage/word density, and stores both the subtitle text and validation metadata
+- when validated subtitles are available, the plain branch can use them directly instead of running audio transcription
+- the diarized branch always requires audio and remains capped at 25 minutes
+- the UI labels each branch as `RapidAPI subtitles`, `OpenAI audio transcript`, or `legacy cache`
 
 The page polls three internal endpoints:
 
