@@ -192,14 +192,22 @@ def get_summary_model_name() -> str:
     return SUMMARY_MODEL_NAME
 
 
+def get_openai_api_key() -> str:
+    raw_api_key = os.getenv("OPENAI_API_KEY")
+    api_key = raw_api_key.strip() if raw_api_key else ""
+    if not api_key:
+        print("Error: OPENAI_API_KEY is not set. Add it to .env or your shell environment.")
+        sys.exit(1)
+    if raw_api_key != api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+    return api_key
+
+
 def get_openai_client() -> OpenAI:
     if OpenAI is None:
         print("Error: openai is not installed. Install dependencies with: pip install -r requirements.txt")
         sys.exit(1)
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("Error: OPENAI_API_KEY is not set. Add it to .env or your shell environment.")
-        sys.exit(1)
+    api_key = get_openai_api_key()
     log_verbose("Creating OpenAI client")
     return OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS)
 

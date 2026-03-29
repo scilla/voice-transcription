@@ -51,6 +51,13 @@ class SpeechTests(unittest.TestCase):
         self.assertIsNone(speech.normalize_language_hint("auto"))
         self.assertEqual(speech.normalize_language_hint("en"), "en")
 
+    def test_get_openai_api_key_strips_surrounding_whitespace(self) -> None:
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": " test-key\n"}, clear=False):
+            api_key = speech.get_openai_api_key()
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "test-key")
+
+        self.assertEqual(api_key, "test-key")
+
     def test_validate_args_rejects_non_youtube_url(self) -> None:
         args = speech.parse_args(["--url", "https://example.com/video"])
 
