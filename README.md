@@ -2,7 +2,7 @@
 
 A small Python utility to transcribe local audio/video files or YouTube videos/lives using OpenAI's transcription models. It can scan the `sources/` folder, download YouTube media into `sources/youtube/`, extract audio when needed, split long recordings into chunks, and save the transcript to `output/<source-name>.txt`.
 
-The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `youtube.cill.app/...` or `www.youtube.cill.app/...` back to the original `youtube.com` URL, reuses cached transcript/summary artifacts when possible, queues cache misses for a local worker to process, and renders the transcript first with the summary below it.
+The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `youtube.cill.app/...` or `www.youtube.cill.app/...` back to the original `youtube.com` URL, reuses cached transcript/summary artifacts when possible, queues cache misses for a local worker to process, and renders plain and diarized transcript/summary outputs side by side.
 
 ## Features
 
@@ -17,8 +17,10 @@ The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `
 - Optional diarized transcription (speaker-labeled segments) with `--diarize`, using `gpt-4o-transcribe-diarize`
 - Optional second-step summary with `--summarize`
 - Saves the full transcript and, when diarization is enabled, speaker-labeled segments
-- FastAPI web app for `youtube.cill.app` with transcript-first rendering and polling job states
+- FastAPI web app for `youtube.cill.app` with side-by-side plain and diarized rendering plus polling job states
 - Queue-based web processing for cache misses, consumed by a local worker
+- Parallel worker execution for plain and diarized transcript+summary branches
+- Optional RapidAPI YouTube helper layer for subtitle retrieval and future media download fallback
 - Local filesystem cache for web development plus Vercel Blob support in production
 
 ## Requirements
@@ -31,6 +33,13 @@ The repo also includes a small FastAPI app for `youtube.cill.app`. It rewrites `
 ```
 openai
 python-dotenv
+fastapi
+uvicorn
+yt-dlp
+vercel-blob
+vercel
+requests
+httpx
 # Note: ffmpeg must be installed separately (brew install ffmpeg on macOS)
 ```
 
@@ -52,6 +61,13 @@ Create a `.env` file in the project root (or set environment variables) with you
 
 ```
 OPENAI_API_KEY=sk-...
+```
+
+Optional environment variables:
+
+```
+X_RAPIDAPI_KEY=...
+BLOB_READ_WRITE_TOKEN=...
 ```
 
 ## Usage
@@ -136,13 +152,14 @@ After completion you'll see the output printed to the terminal and find the tran
 The web app is FastAPI-based and is intended for Vercel deployment. v1 is intentionally narrow:
 
 - YouTube VOD only
-- plain transcription only
-- automatic summary after transcript
+- automatic plain and diarized transcription
+- automatic summary after each transcript branch
 - no live streams
 - no local file uploads
 - no ffmpeg/chunking in the web request path
 - hard limit: 25 minutes per video
 - hard limit: 20 MB downloaded audio size
+- optional RapidAPI subtitle lookup when `X_RAPIDAPI_KEY` is configured
 
 ### Local Run
 
@@ -165,9 +182,11 @@ Any `*.localhost` hostname resolves locally in modern browsers, so you can test 
 - `youtube.cill.app/watch?v=...` becomes `https://youtube.com/watch?v=...`
 - `www.youtube.cill.app/watch?v=...` becomes `https://www.youtube.com/watch?v=...`
 - the page creates or reuses a deterministic job
-- if cached transcript and summary already exist, the job returns immediately
-- if only the transcript exists, the job is queued so the worker can generate only the summary
-- otherwise the app queues the job immediately and a local worker downloads audio with Python `yt_dlp`, transcribes it, then summarizes it
+- the page renders two columns: `Plain` and `Diarized`
+- if both branches already have transcript and summary, the job returns immediately
+- if one branch is cached and the other is missing, the cached branch appears immediately while the worker fills the missing branch
+- the worker downloads audio once, then computes the plain and diarized transcript+summary branches in parallel
+- if `X_RAPIDAPI_KEY` is configured, the worker also attempts a YouTube subtitle lookup and stores subtitle metadata for later quality checks
 
 The page polls three internal endpoints:
 
@@ -203,7 +222,7 @@ In local development, the worker uses the filesystem cache. In production, if `B
 
 In local development the web app reuses the repo's existing CLI artifacts:
 
-- transcript and summary from `output/`
+- plain or diarized transcript and summary from `output/`
 - downloaded YouTube audio from `sources/youtube/`
 
 That means previously processed videos like `zFcyWFK1q8I` can render immediately in the web app without a new download or OpenAI call.
@@ -217,6 +236,7 @@ Required environment variables in Vercel:
 ```bash
 OPENAI_API_KEY=...
 BLOB_READ_WRITE_TOKEN=...
+X_RAPIDAPI_KEY=... # optional
 ```
 
 Production persistence uses Vercel Blob:
@@ -224,6 +244,10 @@ Production persistence uses Vercel Blob:
 - `meta.json`
 - `transcript.txt`
 - `summary.txt`
+- `diarized_transcript.txt`
+- `diarized_summary.txt`
+- `rapidapi_subtitle_metadata.json`
+- `rapidapi_subtitle_text.txt`
 
 Each job is stored under a deterministic cache key derived from `youtube:<video_id>:plain:auto`.
 

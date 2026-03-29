@@ -21,6 +21,10 @@ LOCAL_WEB_CACHE_DIRNAME = "web-cache"
 WEB_STATE_FILENAME = "meta.json"
 WEB_TRANSCRIPT_FILENAME = "transcript.txt"
 WEB_SUMMARY_FILENAME = "summary.txt"
+WEB_DIARIZED_TRANSCRIPT_FILENAME = "diarized_transcript.txt"
+WEB_DIARIZED_SUMMARY_FILENAME = "diarized_summary.txt"
+WEB_RAPIDAPI_SUBTITLE_METADATA_FILENAME = "rapidapi_subtitle_metadata.json"
+WEB_RAPIDAPI_SUBTITLE_TEXT_FILENAME = "rapidapi_subtitle_text.txt"
 
 
 class StorageBackend(ABC):
@@ -87,6 +91,10 @@ class LocalStorageBackend(StorageBackend):
             return self._read_legacy_transcript(video_id)
         if filename == WEB_SUMMARY_FILENAME:
             return self._read_legacy_summary(video_id)
+        if filename == WEB_DIARIZED_TRANSCRIPT_FILENAME:
+            return self._read_legacy_diarized_transcript(video_id)
+        if filename == WEB_DIARIZED_SUMMARY_FILENAME:
+            return self._read_legacy_diarized_summary(video_id)
         return None
 
     def write_text(self, job_id: str, filename: str, value: str) -> None:
@@ -124,41 +132,29 @@ class LocalStorageBackend(StorageBackend):
         return matches[0][1]
 
     def _read_legacy_transcript(self, video_id: str) -> Optional[str]:
-        marker = f"[{video_id}]"
-        matches = sorted(
-            [
-                path
-                for path in self.output_dir.iterdir()
-                if path.is_file()
-                and marker in path.name
-                and path.name.endswith("__plain__lang-auto.txt")
-                and not path.name.endswith("__summary.txt")
-            ],
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        if not matches:
-            return None
-
-        content = matches[0].read_text(encoding="utf-8").strip()
-        full_transcript_marker = "\nFull transcript:\n"
-        if full_transcript_marker in content:
-            return content.split(full_transcript_marker, 1)[1].strip()
-
-        parts = content.split("\n\n", 1)
-        if len(parts) == 2:
-            return parts[1].strip()
-        return content
+        return self._read_legacy_variant_output(video_id, mode_tag="plain", summary=False)
 
     def _read_legacy_summary(self, video_id: str) -> Optional[str]:
+        return self._read_legacy_variant_output(video_id, mode_tag="plain", summary=True)
+
+    def _read_legacy_diarized_transcript(self, video_id: str) -> Optional[str]:
+        return self._read_legacy_variant_output(video_id, mode_tag="diarized", summary=False)
+
+    def _read_legacy_diarized_summary(self, video_id: str) -> Optional[str]:
+        return self._read_legacy_variant_output(video_id, mode_tag="diarized", summary=True)
+
+    def _read_legacy_variant_output(self, video_id: str, *, mode_tag: str, summary: bool) -> Optional[str]:
         marker = f"[{video_id}]"
+        suffix = "__summary.txt" if summary else ".txt"
         matches = sorted(
             [
                 path
                 for path in self.output_dir.iterdir()
                 if path.is_file()
                 and marker in path.name
-                and path.name.endswith("__plain__lang-auto__summary.txt")
+                and f"__{mode_tag}__lang-auto" in path.name
+                and path.name.endswith(suffix)
+                and (summary or not path.name.endswith("__summary.txt"))
             ],
             key=lambda path: path.stat().st_mtime,
             reverse=True,
@@ -167,9 +163,14 @@ class LocalStorageBackend(StorageBackend):
             return None
 
         content = matches[0].read_text(encoding="utf-8").strip()
-        summary_marker = "\nSummary:\n"
-        if summary_marker in content:
-            return content.split(summary_marker, 1)[1].strip()
+        if summary:
+            summary_marker = "\nSummary:\n"
+            if summary_marker in content:
+                return content.split(summary_marker, 1)[1].strip()
+        else:
+            full_transcript_marker = "\nFull transcript:\n"
+            if full_transcript_marker in content:
+                return content.split(full_transcript_marker, 1)[1].strip()
         parts = content.split("\n\n", 1)
         if len(parts) == 2:
             return parts[1].strip()

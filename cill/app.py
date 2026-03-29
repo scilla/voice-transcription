@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import copy
+import concurrent.futures
 import hashlib
 import json
 import os
 import shutil
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -16,6 +19,7 @@ from pydantic import BaseModel
 from yt_dlp import DownloadError, YoutubeDL
 
 import speech
+from cill import rapidapi_youtube
 from cill.shared import (
     classify_youtube_live_status,
     extract_youtube_video_id,
@@ -23,6 +27,10 @@ from cill.shared import (
     sanitize_filename_component,
 )
 from cill.storage import (
+    WEB_DIARIZED_SUMMARY_FILENAME,
+    WEB_DIARIZED_TRANSCRIPT_FILENAME,
+    WEB_RAPIDAPI_SUBTITLE_METADATA_FILENAME,
+    WEB_RAPIDAPI_SUBTITLE_TEXT_FILENAME,
     WEB_SUMMARY_FILENAME,
     WEB_TRANSCRIPT_FILENAME,
     create_storage_backend,
@@ -42,6 +50,21 @@ YTDLP_WEB_FORMAT = (
     "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio[ext=webm]/"
     "bestaudio[ext=ogg]/bestaudio[acodec!=none]/bestaudio"
 )
+VARIANT_DEFINITIONS = {
+    "plain": {
+        "label": "Plain transcript",
+        "diarize": False,
+        "transcript_filename": WEB_TRANSCRIPT_FILENAME,
+        "summary_filename": WEB_SUMMARY_FILENAME,
+    },
+    "diarized": {
+        "label": "Diarized transcript",
+        "diarize": True,
+        "transcript_filename": WEB_DIARIZED_TRANSCRIPT_FILENAME,
+        "summary_filename": WEB_DIARIZED_SUMMARY_FILENAME,
+    },
+}
+VARIANT_TERMINAL_STATUSES = {"complete", "cache_hit", "error"}
 FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="cill app icon">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -65,6 +88,117 @@ class JobCreateRequest(BaseModel):
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def build_variant_state(name: str) -> dict[str, Any]:
+    config = VARIANT_DEFINITIONS[name]
+    return {
+        "name": name,
+        "label": config["label"],
+        "diarize": config["diarize"],
+        "status": "idle",
+        "error": None,
+        "transcript_ready": False,
+        "summary_ready": False,
+    }
+
+
+def ensure_variant_map(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    variants = state.setdefault("variants", {})
+    for name in VARIANT_DEFINITIONS:
+        merged = build_variant_state(name)
+        merged.update(variants.get(name, {}))
+        variants[name] = merged
+    return variants
+
+
+def ensure_rapidapi_state(state: dict[str, Any]) -> dict[str, Any]:
+    rapidapi_state = {
+        "configured": rapidapi_youtube.is_configured(),
+        "subtitle_available": False,
+        "subtitle_fetched": False,
+        "subtitle_language": None,
+        "subtitle_kind": None,
+        "subtitle_word_count": 0,
+        "subtitle_chars": 0,
+        "subtitle_duration_seconds": None,
+        "error": None,
+    }
+    rapidapi_state.update(state.get("rapidapi") or {})
+    state["rapidapi"] = rapidapi_state
+    return rapidapi_state
+
+
+def variant_has_any_output(variant: dict[str, Any]) -> bool:
+    return bool(variant.get("transcript_ready") or variant.get("summary_ready"))
+
+
+def variant_is_terminal(variant: dict[str, Any]) -> bool:
+    return variant.get("status") in VARIANT_TERMINAL_STATUSES
+
+
+def any_variant_output(state: dict[str, Any]) -> bool:
+    return any(variant_has_any_output(variant) for variant in ensure_variant_map(state).values())
+
+
+def all_variants_ready(state: dict[str, Any]) -> bool:
+    return all(variant.get("transcript_ready") and variant.get("summary_ready") for variant in ensure_variant_map(state).values())
+
+
+def all_variants_terminal(state: dict[str, Any]) -> bool:
+    return all(variant_is_terminal(variant) for variant in ensure_variant_map(state).values())
+
+
+def derive_state_error(state: dict[str, Any]) -> Optional[str]:
+    status = state.get("status")
+    current_error = state.get("error")
+    if status in {"unsupported_live", "unsupported_duration", "unsupported_size"}:
+        return current_error
+
+    variant_errors = [
+        variant.get("error")
+        for variant in ensure_variant_map(state).values()
+        if variant.get("status") == "error" and variant.get("error")
+    ]
+    if all_variants_terminal(state) and not any_variant_output(state):
+        return variant_errors[0] if variant_errors else current_error
+    return current_error if status == "error" and not any_variant_output(state) else None
+
+
+def derive_overall_status(state: dict[str, Any]) -> str:
+    current_status = state.get("status") or "idle"
+    if current_status in {"unsupported_live", "unsupported_duration", "unsupported_size"}:
+        return current_status
+    if current_status == "error" and not any_variant_output(state):
+        return "error"
+
+    variants = ensure_variant_map(state)
+    if all(variant.get("status") == "cache_hit" for variant in variants.values()):
+        return "cache_hit"
+    if all_variants_terminal(state):
+        return "complete" if any_variant_output(state) else "error"
+    if any(variant.get("status") == "summarizing" for variant in variants.values()):
+        return "summarizing"
+    if any(variant.get("status") == "transcribing" for variant in variants.values()):
+        return "transcribing"
+    if current_status == "downloading":
+        return "downloading"
+    if any(variant.get("status") == "queued" for variant in variants.values()):
+        return "queued"
+    return current_status
+
+
+def build_state_for_storage(state: dict[str, Any]) -> dict[str, Any]:
+    stored = copy.deepcopy(state)
+    stored.pop("transcript", None)
+    stored.pop("summary", None)
+    rapidapi_state = stored.get("rapidapi") or {}
+    rapidapi_state.pop("subtitle_text", None)
+    stored["rapidapi"] = rapidapi_state
+    for variant in (stored.get("variants") or {}).values():
+        variant.pop("transcript", None)
+        variant.pop("summary", None)
+    return stored
 
 
 def strip_port(host: str) -> str:
@@ -101,7 +235,7 @@ def make_job_id(cache_key: str) -> str:
 def create_job_state(source_url: str, metadata: dict[str, Any], status: str) -> dict[str, Any]:
     video_id = metadata.get("id") or "unknown"
     cache_key = make_cache_key(video_id)
-    return {
+    state = {
         "job_id": make_job_id(cache_key),
         "cache_key": cache_key,
         "source_url": source_url,
@@ -115,12 +249,15 @@ def create_job_state(source_url: str, metadata: dict[str, Any], status: str) -> 
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
+    ensure_variant_map(state)
+    ensure_rapidapi_state(state)
+    return state
 
 
 def create_error_state(source_url: str, error_message: str) -> dict[str, Any]:
     video_id = extract_youtube_video_id(source_url) or "unknown"
     cache_key = make_cache_key(video_id)
-    return {
+    state = {
         "job_id": make_job_id(cache_key),
         "cache_key": cache_key,
         "source_url": source_url,
@@ -134,6 +271,9 @@ def create_error_state(source_url: str, error_message: str) -> dict[str, Any]:
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
+    ensure_variant_map(state)
+    ensure_rapidapi_state(state)
+    return state
 
 
 def update_state(state: dict[str, Any], *, status: Optional[str] = None, error: Optional[str] = None) -> dict[str, Any]:
@@ -179,10 +319,83 @@ def probe_youtube_metadata(source_url: str) -> dict[str, Any]:
         return ydl.extract_info(source_url, download=False)
 
 
+def maybe_fetch_rapidapi_subtitles(state: dict[str, Any], duration_seconds: Optional[float]) -> dict[str, Any]:
+    rapidapi_state = ensure_rapidapi_state(state)
+    if rapidapi_state.get("subtitle_fetched") or not rapidapi_youtube.is_configured():
+        rapidapi_state["configured"] = rapidapi_youtube.is_configured()
+        return state
+
+    try:
+        client = rapidapi_youtube.RapidAPIYoutubeClient.from_env()
+        details = client.get_video_details(state["video_id"])
+        track = rapidapi_youtube.choose_subtitle_track(
+            rapidapi_youtube.extract_subtitle_tracks(details)
+        )
+        if not track:
+            rapidapi_state.update(
+                {
+                    "configured": True,
+                    "subtitle_available": False,
+                    "subtitle_fetched": True,
+                    "error": None,
+                }
+            )
+            return persist_state(state)
+
+        subtitle_text = rapidapi_youtube.normalize_subtitle_text(
+            client.get_subtitle_text(track["url"], format="srt", fix_overlap=True)
+        )
+        subtitle_stats = rapidapi_youtube.build_subtitle_stats(subtitle_text, duration_seconds)
+        subtitle_metadata = {
+            "details": {
+                "lengthSeconds": details.get("lengthSeconds"),
+                "isLiveStream": details.get("isLiveStream"),
+                "isLiveNow": details.get("isLiveNow"),
+            },
+            "selected_track": track,
+            "stats": subtitle_stats,
+            "fetched_at": utc_now_iso(),
+        }
+        storage.write_text(
+            state["job_id"],
+            WEB_RAPIDAPI_SUBTITLE_METADATA_FILENAME,
+            json.dumps(subtitle_metadata, indent=2, sort_keys=True),
+        )
+        storage.write_text(
+            state["job_id"],
+            WEB_RAPIDAPI_SUBTITLE_TEXT_FILENAME,
+            subtitle_text,
+        )
+        rapidapi_state.update(
+            {
+                "configured": True,
+                "subtitle_available": True,
+                "subtitle_fetched": True,
+                "subtitle_language": track.get("code"),
+                "subtitle_kind": track.get("kind"),
+                "subtitle_word_count": subtitle_stats.get("word_count", 0),
+                "subtitle_chars": subtitle_stats.get("char_count", 0),
+                "subtitle_duration_seconds": subtitle_stats.get("duration_seconds"),
+                "error": None,
+            }
+        )
+        return persist_state(state)
+    except Exception as exc:
+        rapidapi_state.update(
+            {
+                "configured": True,
+                "subtitle_available": False,
+                "subtitle_fetched": True,
+                "error": str(exc),
+            }
+        )
+        return persist_state(state)
+
+
 def queue_job_state(source_url: str, video_id: str, *, transcript_ready: bool = False, summary_ready: bool = False) -> dict[str, Any]:
     cache_key = make_cache_key(video_id)
     timestamp = utc_now_iso()
-    return {
+    state = {
         "job_id": make_job_id(cache_key),
         "cache_key": cache_key,
         "source_url": source_url,
@@ -196,6 +409,16 @@ def queue_job_state(source_url: str, video_id: str, *, transcript_ready: bool = 
         "created_at": timestamp,
         "updated_at": timestamp,
     }
+    variants = ensure_variant_map(state)
+    variants["plain"]["transcript_ready"] = transcript_ready
+    variants["plain"]["summary_ready"] = summary_ready
+    if transcript_ready and summary_ready:
+        variants["plain"]["status"] = "cache_hit"
+    else:
+        variants["plain"]["status"] = "queued"
+    variants["diarized"]["status"] = "queued"
+    ensure_rapidapi_state(state)
+    return state
 
 
 def find_downloaded_file(download_dir: str, video_id: str) -> Optional[str]:
@@ -209,6 +432,37 @@ def find_downloaded_file(download_dir: str, video_id: str) -> Optional[str]:
         return None
     matches.sort(key=lambda item: item[0], reverse=True)
     return matches[0][1]
+
+
+def get_variant_artifact_names(name: str) -> tuple[str, str]:
+    config = VARIANT_DEFINITIONS[name]
+    return config["transcript_filename"], config["summary_filename"]
+
+
+def update_variant_state(
+    state: dict[str, Any],
+    variant_name: str,
+    *,
+    status: Optional[str] = None,
+    error: Optional[str] = None,
+    transcript_ready: Optional[bool] = None,
+    summary_ready: Optional[bool] = None,
+) -> dict[str, Any]:
+    variant = ensure_variant_map(state)[variant_name]
+    if status is not None:
+        variant["status"] = status
+    if error is not None or status == "error":
+        variant["error"] = error
+    if transcript_ready is not None:
+        variant["transcript_ready"] = transcript_ready
+    if summary_ready is not None:
+        variant["summary_ready"] = summary_ready
+    state["updated_at"] = utc_now_iso()
+    return state
+
+
+def variant_needs_work(variant: dict[str, Any]) -> bool:
+    return not (variant.get("transcript_ready") and variant.get("summary_ready"))
 
 
 def download_audio(source_url: str, state: dict[str, Any]) -> tuple[str, bool]:
@@ -254,22 +508,71 @@ def download_audio(source_url: str, state: dict[str, Any]) -> tuple[str, bool]:
 
 def hydrate_state(state: dict[str, Any]) -> dict[str, Any]:
     video_id = state.get("video_id")
-    transcript_text = storage.read_text(state["job_id"], WEB_TRANSCRIPT_FILENAME, video_id=video_id)
-    summary_text = storage.read_text(state["job_id"], WEB_SUMMARY_FILENAME, video_id=video_id)
-
     hydrated = dict(state)
-    hydrated["transcript"] = transcript_text
-    hydrated["summary"] = summary_text
-    hydrated["transcript_ready"] = bool(transcript_text)
-    hydrated["summary_ready"] = bool(summary_text)
+    variants = ensure_variant_map(hydrated)
+    rapidapi_state = ensure_rapidapi_state(hydrated)
 
-    if hydrated["status"] in {"idle", "queued"} and hydrated["transcript_ready"] and hydrated["summary_ready"]:
-        hydrated["status"] = "cache_hit"
+    for name, config in VARIANT_DEFINITIONS.items():
+        variant = variants[name]
+        transcript_text = storage.read_text(
+            hydrated["job_id"],
+            config["transcript_filename"],
+            video_id=video_id,
+        )
+        summary_text = storage.read_text(
+            hydrated["job_id"],
+            config["summary_filename"],
+            video_id=video_id,
+        )
+        variant["transcript"] = transcript_text
+        variant["summary"] = summary_text
+        variant["transcript_ready"] = bool(transcript_text)
+        variant["summary_ready"] = bool(summary_text)
+        if variant["transcript_ready"] and variant["summary_ready"] and variant.get("status") in {"idle", "queued"}:
+            variant["status"] = "cache_hit"
+        elif variant["transcript_ready"] and not variant["summary_ready"] and variant.get("status") == "idle":
+            variant["status"] = "queued"
+
+    subtitle_metadata_raw = storage.read_text(
+        hydrated["job_id"],
+        WEB_RAPIDAPI_SUBTITLE_METADATA_FILENAME,
+        video_id=video_id,
+    )
+    if subtitle_metadata_raw:
+        try:
+            subtitle_metadata = json.loads(subtitle_metadata_raw)
+        except json.JSONDecodeError:
+            subtitle_metadata = {}
+        rapidapi_state.update(
+            {
+                "subtitle_available": bool(subtitle_metadata),
+                "subtitle_fetched": bool(subtitle_metadata),
+                "subtitle_language": subtitle_metadata.get("selected_track", {}).get("code"),
+                "subtitle_kind": subtitle_metadata.get("selected_track", {}).get("kind"),
+                "subtitle_word_count": subtitle_metadata.get("stats", {}).get("word_count", 0),
+                "subtitle_chars": subtitle_metadata.get("stats", {}).get("char_count", 0),
+                "subtitle_duration_seconds": subtitle_metadata.get("stats", {}).get("duration_seconds"),
+                "error": subtitle_metadata.get("error"),
+            }
+        )
+
+    hydrated["transcript"] = variants["plain"].get("transcript")
+    hydrated["summary"] = variants["plain"].get("summary")
+    hydrated["transcript_ready"] = variants["plain"]["transcript_ready"]
+    hydrated["summary_ready"] = variants["plain"]["summary_ready"]
+    hydrated["error"] = derive_state_error(hydrated)
+    hydrated["status"] = derive_overall_status(hydrated)
     return hydrated
 
 
 def persist_state(state: dict[str, Any]) -> dict[str, Any]:
-    storage.save_state(state["job_id"], state)
+    ensure_variant_map(state)
+    ensure_rapidapi_state(state)
+    state["transcript_ready"] = state["variants"]["plain"].get("transcript_ready", False)
+    state["summary_ready"] = state["variants"]["plain"].get("summary_ready", False)
+    state["error"] = derive_state_error(state)
+    state["status"] = derive_overall_status(state)
+    storage.save_state(state["job_id"], build_state_for_storage(state))
     return state
 
 
@@ -277,6 +580,11 @@ def prepare_job_for_processing(state: dict[str, Any]) -> dict[str, Any]:
     metadata = probe_youtube_metadata(state["source_url"])
     state["title"] = metadata.get("title") or state.get("title") or "Unknown"
     state["uploader"] = metadata.get("channel") or metadata.get("uploader") or state.get("uploader") or "Unknown"
+    for variant_name in VARIANT_DEFINITIONS:
+        variant = ensure_variant_map(state)[variant_name]
+        if variant_needs_work(variant):
+            variant["status"] = "queued"
+            variant["error"] = None
     persist_state(update_state(state, status="queued", error=None))
 
     live_status = classify_youtube_live_status(metadata)
@@ -301,27 +609,34 @@ def prepare_job_for_processing(state: dict[str, Any]) -> dict[str, Any]:
         )
         return hydrate_state(state)
 
+    maybe_fetch_rapidapi_subtitles(state, duration_seconds)
     return hydrate_state(state)
 
 
 def process_job(state: dict[str, Any]) -> dict[str, Any]:
     hydrated = hydrate_state(state)
-    transcript_text = hydrated.get("transcript")
-    summary_text = hydrated.get("summary")
-
-    if hydrated["status"] in ACTIVE_STATUSES:
+    if hydrated["status"] in ACTIVE_STATUSES | UNSUPPORTED_STATUSES:
         return hydrated
-    if hydrated["status"] in UNSUPPORTED_STATUSES:
-        return hydrated
-    if transcript_text and summary_text:
-        hydrated["status"] = "cache_hit"
-        return persist_state(update_state(hydrated, status="cache_hit"))
+    if all_variants_terminal(hydrated) and derive_overall_status(hydrated) in TERMINAL_STATUSES:
+        return hydrate_state(persist_state(hydrated))
 
     audio_path: Optional[str] = None
     cleanup_temp_dir = False
 
     try:
-        if not transcript_text:
+        variants = ensure_variant_map(hydrated)
+        needs_transcription = any(
+            not variant.get("transcript_ready") for variant in variants.values()
+        )
+        variants_needing_work = [
+            variant_name
+            for variant_name, variant in variants.items()
+            if variant_needs_work(variant)
+        ]
+        if not variants_needing_work:
+            return hydrate_state(persist_state(hydrated))
+
+        if needs_transcription:
             hydrated = prepare_job_for_processing(hydrated)
             if hydrated["status"] in TERMINAL_STATUSES:
                 return hydrated
@@ -344,24 +659,88 @@ def process_job(state: dict[str, Any]) -> dict[str, Any]:
                     )
                 )
                 return hydrate_state(hydrated)
+        else:
+            audio_path = storage.find_cached_audio(hydrated["video_id"]) or ""
 
-            persist_state(update_state(hydrated, status="transcribing"))
-            _, _, transcript_text = speech.transcribe_audio_file(audio_path, None, diarize=False)
-            storage.write_text(hydrated["job_id"], WEB_TRANSCRIPT_FILENAME, transcript_text)
-            hydrated["transcript_ready"] = True
-            persist_state(update_state(hydrated, status="summarizing"))
+        state_lock = threading.Lock()
 
-        if not summary_text:
-            if not audio_path:
-                audio_path = storage.find_cached_audio(hydrated["video_id"]) or hydrated.get("selected_source_path") or ""
-            persist_state(update_state(hydrated, status="summarizing"))
-            source_context = build_source_context(hydrated, audio_path or hydrated["video_id"])
-            summary_text = speech.summarize_transcript(transcript_text, source_context)
-            storage.write_text(hydrated["job_id"], WEB_SUMMARY_FILENAME, summary_text)
-            hydrated["summary_ready"] = True
+        def process_variant(variant_name: str) -> None:
+            variant_config = VARIANT_DEFINITIONS[variant_name]
+            transcript_filename, summary_filename = get_variant_artifact_names(variant_name)
 
-        persist_state(update_state(hydrated, status="complete"))
-        return hydrate_state(hydrated)
+            with state_lock:
+                variant = hydrated["variants"][variant_name]
+                transcript_text = variant.get("transcript")
+                summary_text = variant.get("summary")
+                if transcript_text and summary_text:
+                    variant["status"] = "cache_hit"
+                    variant["error"] = None
+                    persist_state(hydrated)
+                    return
+
+            try:
+                if not transcript_text:
+                    with state_lock:
+                        update_variant_state(
+                            hydrated,
+                            variant_name,
+                            status="transcribing",
+                            error=None,
+                            transcript_ready=False,
+                        )
+                        persist_state(hydrated)
+                    _, _, transcript_text = speech.transcribe_audio_file(
+                        audio_path or hydrated["video_id"],
+                        None,
+                        diarize=variant_config["diarize"],
+                    )
+                    storage.write_text(hydrated["job_id"], transcript_filename, transcript_text)
+                    with state_lock:
+                        hydrated["variants"][variant_name]["transcript"] = transcript_text
+                        update_variant_state(
+                            hydrated,
+                            variant_name,
+                            status="summarizing" if not summary_text else "complete",
+                            error=None,
+                            transcript_ready=True,
+                        )
+                        persist_state(hydrated)
+
+                if not summary_text:
+                    with state_lock:
+                        update_variant_state(
+                            hydrated,
+                            variant_name,
+                            status="summarizing",
+                            error=None,
+                            summary_ready=False,
+                        )
+                        persist_state(hydrated)
+                    source_context = build_source_context(hydrated, audio_path or hydrated["video_id"])
+                    summary_text = speech.summarize_transcript(transcript_text or "", source_context)
+                    storage.write_text(hydrated["job_id"], summary_filename, summary_text)
+                    with state_lock:
+                        hydrated["variants"][variant_name]["summary"] = summary_text
+                        update_variant_state(
+                            hydrated,
+                            variant_name,
+                            status="complete",
+                            error=None,
+                            transcript_ready=bool(transcript_text),
+                            summary_ready=True,
+                        )
+                        persist_state(hydrated)
+            except Exception as exc:
+                with state_lock:
+                    update_variant_state(hydrated, variant_name, status="error", error=str(exc))
+                    persist_state(hydrated)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(variants_needing_work)) as executor:
+            futures = [executor.submit(process_variant, variant_name) for variant_name in variants_needing_work]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        return hydrate_state(persist_state(update_state(hydrated, status=derive_overall_status(hydrated), error=derive_state_error(hydrated))))
     except Exception as exc:  # pragma: no cover - network dependent
         persist_state(update_state(hydrated, status="error", error=str(exc)))
         return hydrate_state(hydrated)
@@ -384,20 +763,34 @@ def create_or_reuse_job(source_url: str) -> dict[str, Any]:
     existing_state = storage.load_state(job_id)
     if existing_state:
         hydrated = hydrate_state(existing_state)
-        if hydrated["status"] == "error" and not hydrated["transcript_ready"] and not hydrated["summary_ready"]:
+        if hydrated["status"] == "error" and not any_variant_output(hydrated):
             return hydrate_state(persist_state(update_state(existing_state, status="queued", error=None)))
         return hydrated
 
-    cached_transcript = storage.read_text(job_id, WEB_TRANSCRIPT_FILENAME, video_id=video_id)
-    cached_summary = storage.read_text(job_id, WEB_SUMMARY_FILENAME, video_id=video_id)
-    if cached_transcript or cached_summary:
-        cached_state = queue_job_state(
-            source_url,
-            video_id,
-            transcript_ready=bool(cached_transcript),
-            summary_ready=bool(cached_summary),
+    cached_plain_transcript = storage.read_text(job_id, WEB_TRANSCRIPT_FILENAME, video_id=video_id)
+    cached_plain_summary = storage.read_text(job_id, WEB_SUMMARY_FILENAME, video_id=video_id)
+    cached_diarized_transcript = storage.read_text(job_id, WEB_DIARIZED_TRANSCRIPT_FILENAME, video_id=video_id)
+    cached_diarized_summary = storage.read_text(job_id, WEB_DIARIZED_SUMMARY_FILENAME, video_id=video_id)
+    if any(
+        (
+            cached_plain_transcript,
+            cached_plain_summary,
+            cached_diarized_transcript,
+            cached_diarized_summary,
         )
-        if cached_transcript and cached_summary:
+    ):
+        cached_state = queue_job_state(source_url, video_id)
+        plain_variant = ensure_variant_map(cached_state)["plain"]
+        diarized_variant = ensure_variant_map(cached_state)["diarized"]
+        plain_variant["transcript_ready"] = bool(cached_plain_transcript)
+        plain_variant["summary_ready"] = bool(cached_plain_summary)
+        plain_variant["status"] = "cache_hit" if cached_plain_transcript and cached_plain_summary else "queued"
+        diarized_variant["transcript_ready"] = bool(cached_diarized_transcript)
+        diarized_variant["summary_ready"] = bool(cached_diarized_summary)
+        diarized_variant["status"] = (
+            "cache_hit" if cached_diarized_transcript and cached_diarized_summary else "queued"
+        )
+        if all_variants_ready(cached_state):
             cached_state["status"] = "cache_hit"
         return hydrate_state(persist_state(cached_state))
 
@@ -443,38 +836,119 @@ def render_processing_page(source_url: str) -> str:
     <title>cill.app</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <style>
-      body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem 4rem; line-height: 1.5; }}
+      body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 84rem; padding: 0 1rem 4rem; line-height: 1.5; }}
       h1, h2 {{ margin-bottom: 0.5rem; }}
       .meta {{ color: #4b5563; margin-bottom: 1rem; }}
       .status {{ background: #eff6ff; border: 1px solid #93c5fd; padding: 0.75rem 1rem; border-radius: 0.5rem; margin-bottom: 1rem; }}
+      .subtitle-meta {{ color: #475569; margin-bottom: 1rem; }}
       .error {{ background: #fef2f2; border-color: #fca5a5; }}
       pre {{ white-space: pre-wrap; background: #f8fafc; padding: 1rem; border-radius: 0.5rem; border: 1px solid #e5e7eb; }}
       section {{ margin-top: 1.5rem; }}
+      .columns {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; align-items: start; }}
+      .column {{ border: 1px solid #e5e7eb; border-radius: 0.75rem; padding: 1rem; background: #ffffff; }}
+      .column-status {{ color: #475569; font-size: 0.95rem; margin: 0 0 0.75rem; }}
+      .column-status.error {{ color: #b91c1c; }}
+      @media (max-width: 900px) {{
+        .columns {{ grid-template-columns: 1fr; }}
+      }}
     </style>
   </head>
   <body>
     <h1>cill.app</h1>
     <p class="meta">Source URL: <a id="source-link" href={serialized_url}></a></p>
     <div id="status" class="status">Creating job…</div>
-    <section id="transcript-section" hidden>
-      <h2>Transcript</h2>
-      <pre id="transcript"></pre>
-    </section>
-    <section id="summary-section" hidden>
-      <h2>Summary</h2>
-      <pre id="summary"></pre>
-    </section>
+    <p id="subtitle-meta" class="subtitle-meta" hidden></p>
+    <div class="columns">
+      <section class="column" id="plain-column">
+        <h2>Plain</h2>
+        <p id="plain-status" class="column-status">Waiting…</p>
+        <section id="plain-transcript-section" hidden>
+          <h3>Transcript</h3>
+          <pre id="plain-transcript"></pre>
+        </section>
+        <section id="plain-summary-section" hidden>
+          <h3>Summary</h3>
+          <pre id="plain-summary"></pre>
+        </section>
+      </section>
+      <section class="column" id="diarized-column">
+        <h2>Diarized</h2>
+        <p id="diarized-status" class="column-status">Waiting…</p>
+        <section id="diarized-transcript-section" hidden>
+          <h3>Transcript</h3>
+          <pre id="diarized-transcript"></pre>
+        </section>
+        <section id="diarized-summary-section" hidden>
+          <h3>Summary</h3>
+          <pre id="diarized-summary"></pre>
+        </section>
+      </section>
+    </div>
     <script>
       const sourceUrl = {serialized_url};
       const sourceLink = document.getElementById('source-link');
       const statusEl = document.getElementById('status');
-      const transcriptSection = document.getElementById('transcript-section');
-      const summarySection = document.getElementById('summary-section');
-      const transcriptEl = document.getElementById('transcript');
-      const summaryEl = document.getElementById('summary');
+      const subtitleMetaEl = document.getElementById('subtitle-meta');
+      const variantElements = {{
+        plain: {{
+          status: document.getElementById('plain-status'),
+          transcriptSection: document.getElementById('plain-transcript-section'),
+          transcript: document.getElementById('plain-transcript'),
+          summarySection: document.getElementById('plain-summary-section'),
+          summary: document.getElementById('plain-summary'),
+        }},
+        diarized: {{
+          status: document.getElementById('diarized-status'),
+          transcriptSection: document.getElementById('diarized-transcript-section'),
+          transcript: document.getElementById('diarized-transcript'),
+          summarySection: document.getElementById('diarized-summary-section'),
+          summary: document.getElementById('diarized-summary'),
+        }},
+      }};
       sourceLink.textContent = sourceUrl;
 
       const terminalStates = new Set(['complete', 'cache_hit', 'unsupported_live', 'unsupported_duration', 'unsupported_size', 'error']);
+
+      function renderVariant(name, variant) {{
+        const elements = variantElements[name];
+        const detail = variant.error ? `: ${{variant.error}}` : '';
+        elements.status.textContent = `${{variant.status || 'idle'}}${{detail}}`;
+        elements.status.className = 'column-status' + (variant.error ? ' error' : '');
+
+        if (variant.transcript) {{
+          elements.transcriptSection.hidden = false;
+          elements.transcript.textContent = variant.transcript;
+        }}
+        if (variant.summary) {{
+          elements.summarySection.hidden = false;
+          elements.summary.textContent = variant.summary;
+        }}
+      }}
+
+      function renderRapidApiState(state) {{
+        const rapidapi = state.rapidapi || {{}};
+        if (!rapidapi.subtitle_fetched) {{
+          subtitleMetaEl.hidden = true;
+          return;
+        }}
+        if (rapidapi.subtitle_available) {{
+          const details = [
+            rapidapi.subtitle_language ? `language=${{rapidapi.subtitle_language}}` : null,
+            rapidapi.subtitle_kind ? `kind=${{rapidapi.subtitle_kind}}` : null,
+            rapidapi.subtitle_word_count ? `words=${{rapidapi.subtitle_word_count}}` : null,
+          ].filter(Boolean).join(' · ');
+          subtitleMetaEl.textContent = `RapidAPI subtitles available${{details ? ' (' + details + ')' : ''}}`;
+          subtitleMetaEl.hidden = false;
+          return;
+        }}
+        if (rapidapi.error) {{
+          subtitleMetaEl.textContent = `RapidAPI subtitle lookup failed: ${{rapidapi.error}}`;
+          subtitleMetaEl.hidden = false;
+          return;
+        }}
+        subtitleMetaEl.textContent = 'RapidAPI subtitle lookup completed: no usable subtitles found.';
+        subtitleMetaEl.hidden = false;
+      }}
 
       function renderState(state) {{
         const title = state.title ? `${{state.title}}` : 'Untitled video';
@@ -482,15 +956,9 @@ def render_processing_page(source_url: str) -> str:
         const detail = state.error ? `: ${{state.error}}` : '';
         statusEl.textContent = `${{state.status}} — ${{title}}${{uploader}}${{detail}}`;
         statusEl.className = 'status' + (state.error ? ' error' : '');
-
-        if (state.transcript) {{
-          transcriptSection.hidden = false;
-          transcriptEl.textContent = state.transcript;
-        }}
-        if (state.summary) {{
-          summarySection.hidden = false;
-          summaryEl.textContent = state.summary;
-        }}
+        renderRapidApiState(state);
+        renderVariant('plain', state.variants?.plain || {{}});
+        renderVariant('diarized', state.variants?.diarized || {{}});
       }}
 
       async function fetchState(jobId) {{
@@ -506,7 +974,7 @@ def render_processing_page(source_url: str) -> str:
         while (true) {{
           const state = await fetchState(jobId);
           renderState(state);
-          if (terminalStates.has(state.status) && (state.summary || state.error || state.status === 'cache_hit')) {{
+          if (terminalStates.has(state.status)) {{
             return;
           }}
           await new Promise((resolve) => setTimeout(resolve, delayMs));
